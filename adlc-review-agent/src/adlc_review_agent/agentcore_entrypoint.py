@@ -5,18 +5,38 @@ argv/env, except for the LLM credential: this entrypoint uses
 `AnthropicBedrock` (ambient AWS credentials from the deployment's execution
 role) instead of a per-request Anthropic API key, so `anthropic_api_key` is
 not part of the payload here. `review.py` and the CLI stay untouched —
-`AnthropicBedrock` implements the same `.messages.create()` interface
-`Anthropic` does, so `run_review()` doesn't need to know which one it got.
+`AnthropicBedrock` implements the same `.messages.create()`/`.messages.stream()`
+interface `Anthropic` does, so `review.py` doesn't need to know which one it got.
+
+`handler()` is a generator: the installed `bedrock_agentcore` SDK detects an
+async/sync generator entrypoint and streams each yielded value as an SSE
+frame (`data: {json}\\n\\n`, `text/event-stream`) automatically — see
+runtime/app.py's `_sync_stream_with_error_handling`. That same SDK machinery
+also catches any exception raised mid-generator and synthesizes its own
+`{"error": ..., "error_type": ..., "message": ...}` SSE frame, so this file
+does NOT manually catch MekoMcpError (or anything else) once streaming has
+started -- only the pre-generator validation below, which still returns a
+plain (non-streaming) `{"error": ...}` dict, exactly as before this file
+supported streaming at all.
 """
 
 from __future__ import annotations
+
+from typing import Any, Iterator
 
 from anthropic import AnthropicBedrock
 from bedrock_agentcore.runtime import BedrockAgentCoreApp
 
 from .github_client import GitHubApiError, fetch_pull_request, parse_pr_ref
-from .meko_client import MekoMcpClient, MekoMcpError
-from .review import run_review
+from .meko_client import MekoMcpClient
+from .review import (
+    ReviewConfig,
+    STRICTNESS_FRAGMENTS,
+    TONE_FRAGMENTS,
+    _create_conversation,
+    run_followup_stream,
+    run_review_stream,
+)
 from .slack_client import SlackApiError, post_to_channel
 
 DEFAULT_MEKO_MCP_URL = "https://mcp.mekodata.ai/mcp"
@@ -25,10 +45,10 @@ app = BedrockAgentCoreApp()
 
 
 class InvocationError(RuntimeError):
-    """Raised for a request-shape or upstream error; caught in handler() to
-    produce the {"error": {...}} response shape instead of a 500 — AgentCore's
-    /invocations contract always returns HTTP 200, so callers must check for
-    the "error" key themselves."""
+    """Raised for a request-shape or upstream error caught before any
+    streaming starts; produces the {"error": {...}} response shape instead
+    of a 500 — AgentCore's /invocations contract always returns HTTP 200,
+    so callers must check for the "error" key themselves."""
 
 
 def _require(payload: dict, field: str) -> str:
@@ -38,68 +58,170 @@ def _require(payload: dict, field: str) -> str:
     return value
 
 
-@app.entrypoint
-def handler(payload: dict) -> dict:
+def _resolve_pr(payload: dict) -> tuple[str, str, str | None]:
+    """Returns (title, diff, html_url). Two modes: `pr_title`+`pr_diff`
+    directly (covers the bundled "sample diff" case, which has no real PR
+    to fetch), or `pr_ref`+`github_token` (fetch from GitHub)."""
+    if payload.get("pr_title") and payload.get("pr_diff"):
+        return payload["pr_title"], payload["pr_diff"], payload.get("pr_html_url")
+    pr_ref = _require(payload, "pr_ref")
+    github_token = _require(payload, "github_token")
     try:
-        pr_ref = _require(payload, "pr_ref")
+        ref = parse_pr_ref(pr_ref)
+    except ValueError as exc:
+        raise InvocationError(str(exc)) from exc
+    try:
+        pr = fetch_pull_request(ref, github_token)
+    except GitHubApiError as exc:
+        raise InvocationError(f"GitHub error: {exc}") from exc
+    return pr.title, pr.diff, pr.html_url
+
+
+def _parse_review_config(payload: dict) -> ReviewConfig:
+    tone = payload.get("tone")
+    strictness = payload.get("strictness")
+    return ReviewConfig(
+        enable_knowledge_base=payload.get("enable_knowledge_base", True),
+        enable_memory_search=payload.get("enable_memory_search", False),
+        focus=payload.get("focus"),
+        tone=tone if tone in TONE_FRAGMENTS else None,
+        strictness=strictness if strictness in STRICTNESS_FRAGMENTS else None,
+    )
+
+
+@app.entrypoint
+def handler(payload: dict) -> dict | Iterator[dict[str, Any]]:
+    is_followup = bool(payload.get("question") and payload.get("conversation_id"))
+
+    try:
         datapack_id = _require(payload, "datapack_id")
         meko_pat = _require(payload, "meko_pat")
-        github_token = _require(payload, "github_token")
         meko_mcp_url = payload.get("meko_mcp_url") or DEFAULT_MEKO_MCP_URL
-        slack_token = payload.get("slack_token")
-        slack_channel = payload.get("slack_channel")
+        config = _parse_review_config(payload)
 
-        if slack_token and not slack_channel:
-            raise InvocationError("slack_channel is required when slack_token is set.")
+        if is_followup:
+            question = payload["question"]
+            conversation_id = payload["conversation_id"]
+            prior_review_text = _require(payload, "prior_review_text")
+            slack_token = slack_channel = None  # not offered on follow-up turns
+        else:
+            slack_token = payload.get("slack_token")
+            slack_channel = payload.get("slack_channel")
+            if slack_token and not slack_channel:
+                raise InvocationError("slack_channel is required when slack_token is set.")
+            pr_title, pr_diff, pr_html_url = _resolve_pr(payload)
+    except InvocationError as exc:
+        return {"error": str(exc)}
 
-        try:
-            ref = parse_pr_ref(pr_ref)
-        except ValueError as exc:
-            raise InvocationError(str(exc)) from exc
+    if is_followup:
+        return _stream_followup(
+            meko_mcp_url=meko_mcp_url,
+            meko_pat=meko_pat,
+            datapack_id=datapack_id,
+            conversation_id=conversation_id,
+            prior_review_text=prior_review_text,
+            question=question,
+            config=config,
+        )
+    return _stream_review(
+        meko_mcp_url=meko_mcp_url,
+        meko_pat=meko_pat,
+        datapack_id=datapack_id,
+        pr_title=pr_title,
+        pr_diff=pr_diff,
+        pr_html_url=pr_html_url,
+        config=config,
+        slack_token=slack_token,
+        slack_channel=slack_channel,
+    )
 
-        try:
-            pr = fetch_pull_request(ref, github_token)
-        except GitHubApiError as exc:
-            raise InvocationError(f"GitHub error: {exc}") from exc
 
-        try:
-            with MekoMcpClient(server_url=meko_mcp_url, pat=meko_pat) as meko:
-                result = run_review(
-                    meko=meko,
-                    anthropic_client=AnthropicBedrock(),
-                    datapack_id=datapack_id,
-                    pr_title=pr.title,
-                    pr_diff=pr.diff,
-                )
-        except MekoMcpError as exc:
-            raise InvocationError(f"Meko error: {exc}") from exc
+def _stream_review(
+    *,
+    meko_mcp_url: str,
+    meko_pat: str,
+    datapack_id: str,
+    pr_title: str,
+    pr_diff: str,
+    pr_html_url: str | None,
+    config: ReviewConfig,
+    slack_token: str | None,
+    slack_channel: str | None,
+) -> Iterator[dict[str, Any]]:
+    with MekoMcpClient(server_url=meko_mcp_url, pat=meko_pat) as meko:
+        conversation_id = _create_conversation(meko, datapack_id, title=f"Review: {pr_title}")
+        yield {
+            "type": "meta",
+            "pr_title": pr_title,
+            "pr_html_url": pr_html_url,
+            "conversation_id": conversation_id,
+        }
+
+        full_text = ""
+        for event in run_review_stream(
+            meko=meko,
+            anthropic_client=AnthropicBedrock(),
+            datapack_id=datapack_id,
+            pr_title=pr_title,
+            pr_diff=pr_diff,
+            conversation_id=conversation_id,
+            config=config,
+        ):
+            if event["type"] == "text_delta":
+                yield event
+            elif event["type"] == "done":
+                full_text = event["text"]
 
         slack_posted = False
+        slack_error = None
         if slack_token and slack_channel:
             try:
                 post_to_channel(
                     slack_token,
                     slack_channel,
-                    f"*PR review* ({pr.title}, {pr.html_url}):\n{result.text}",
+                    f"*PR review* ({pr_title}, {pr_html_url or 'sample diff'}):\n{full_text}",
                 )
                 slack_posted = True
             except SlackApiError as exc:
-                return {
-                    "pr_title": pr.title,
-                    "pr_html_url": pr.html_url,
-                    "review": result.text,
-                    "slack_posted": False,
-                    "slack_error": str(exc),
-                }
+                slack_error = str(exc)
 
-        return {
-            "pr_title": pr.title,
-            "pr_html_url": pr.html_url,
-            "review": result.text,
+        yield {
+            "type": "done",
+            "review": full_text,
             "slack_posted": slack_posted,
+            "slack_error": slack_error,
         }
-    except InvocationError as exc:
-        return {"error": str(exc)}
+
+
+def _stream_followup(
+    *,
+    meko_mcp_url: str,
+    meko_pat: str,
+    datapack_id: str,
+    conversation_id: str,
+    prior_review_text: str,
+    question: str,
+    config: ReviewConfig,
+) -> Iterator[dict[str, Any]]:
+    with MekoMcpClient(server_url=meko_mcp_url, pat=meko_pat) as meko:
+        yield {"type": "meta", "conversation_id": conversation_id}
+
+        full_text = ""
+        for event in run_followup_stream(
+            meko=meko,
+            anthropic_client=AnthropicBedrock(),
+            datapack_id=datapack_id,
+            conversation_id=conversation_id,
+            prior_review_text=prior_review_text,
+            question=question,
+            config=config,
+        ):
+            if event["type"] == "text_delta":
+                yield event
+            elif event["type"] == "done":
+                full_text = event["text"]
+
+        yield {"type": "done", "review": full_text}
 
 
 if __name__ == "__main__":
