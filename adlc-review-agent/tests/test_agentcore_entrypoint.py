@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from unittest.mock import MagicMock, patch
 
-from adlc_review_agent.agentcore_entrypoint import handler
+from adlc_review_agent.agentcore_entrypoint import DEFAULT_MEKO_MCP_URL, handler
 from adlc_review_agent.github_client import GitHubApiError, PullRequest
 from adlc_review_agent.slack_client import SlackApiError
 
@@ -114,6 +114,38 @@ def test_handler_missing_required_field() -> None:
     events = _events(payload)
 
     assert events == [{"error": "Missing required field: github_token"}]
+
+
+def test_handler_missing_meko_pat_with_no_env_fallback_returns_error(monkeypatch) -> None:
+    monkeypatch.delenv("MEKO_PAT", raising=False)
+    payload = dict(_BASE_PAYLOAD)
+    del payload["meko_pat"]
+
+    events = _events(payload)
+
+    assert events == [{"error": "Missing required field: meko_pat"}]
+
+
+@_patched
+def test_handler_falls_back_to_meko_pat_env_var(
+    mock_anthropic_bedrock, mock_fetch_pr, mock_meko_cls, mock_create_conversation, mock_run_review_stream, mock_post,
+    monkeypatch,
+) -> None:
+    # The shared deployment's payload (meko_ui's invokeSharedDeployment) never
+    # carries meko_pat -- the container's own MEKO_PAT env var, baked in at
+    # deploy time, is what it authenticates with instead.
+    monkeypatch.setenv("MEKO_PAT", "mko_tkn_from_env")
+    mock_fetch_pr.return_value = PullRequest(title="Add endpoint", html_url="https://x", diff="+ x = 1")
+    mock_meko_cls.return_value.__enter__.return_value = MagicMock()
+    mock_create_conversation.return_value = "conv-1"
+    mock_run_review_stream.return_value = iter([{"type": "done", "text": "Looks fine.", "kb_context": "(none found)"}])
+
+    payload = dict(_BASE_PAYLOAD)
+    del payload["meko_pat"]
+    events = _events(payload)
+
+    assert events[-1]["review"] == "Looks fine."
+    mock_meko_cls.assert_called_once_with(server_url=DEFAULT_MEKO_MCP_URL, pat="mko_tkn_from_env")
 
 
 def test_handler_slack_channel_required_with_slack_token() -> None:
