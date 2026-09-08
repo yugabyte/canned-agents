@@ -22,6 +22,7 @@ supported streaming at all.
 
 from __future__ import annotations
 
+import os
 from typing import Any, Iterator
 
 from anthropic import AnthropicBedrock
@@ -56,6 +57,19 @@ def _require(payload: dict, field: str) -> str:
     if not value:
         raise InvocationError(f"Missing required field: {field}")
     return value
+
+
+def _resolve_meko_pat(payload: dict) -> str:
+    """A per-user dedicated deployment gets its caller's own PAT in the
+    payload, same as every other field here. The shared instance every
+    signed-in user can invoke gets none -- meko_ui's invokeSharedDeployment
+    deliberately omits it -- so this falls back to MEKO_PAT, baked into the
+    container's own environment at deploy time (see the README's AgentCore
+    deployment section)."""
+    pat = payload.get("meko_pat") or os.environ.get("MEKO_PAT")
+    if not pat:
+        raise InvocationError("Missing required field: meko_pat")
+    return pat
 
 
 def _resolve_pr(payload: dict) -> tuple[str, str, str | None]:
@@ -95,7 +109,7 @@ def handler(payload: dict) -> dict | Iterator[dict[str, Any]]:
 
     try:
         datapack_id = _require(payload, "datapack_id")
-        meko_pat = _require(payload, "meko_pat")
+        meko_pat = _resolve_meko_pat(payload)
         meko_mcp_url = payload.get("meko_mcp_url") or DEFAULT_MEKO_MCP_URL
         config = _parse_review_config(payload)
 

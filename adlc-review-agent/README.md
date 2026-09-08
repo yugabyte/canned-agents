@@ -69,11 +69,16 @@ payload below.
 |---|---|---|
 | `pr_ref` | yes | `owner/repo#123` |
 | `datapack_id` | yes | Meko datapack holding the org's coding standards |
-| `meko_pat` | yes | Meko Personal Access Token |
+| `meko_pat` | no* | Meko Personal Access Token |
 | `github_token` | yes | GitHub PAT |
 | `meko_mcp_url` | no | Defaults to `https://mcp.mekodata.ai/mcp` |
 | `slack_token` | no | Post the review to Slack if set |
 | `slack_channel` | no | Required if `slack_token` is set |
+
+\* `meko_pat` is required unless the container's own `MEKO_PAT` environment
+variable is set, in which case the payload may omit it entirely — see
+"Deploying as Meko's shared instance" below. A per-user dedicated deployment
+always gets its own `meko_pat` in the payload and ignores `MEKO_PAT`.
 
 **Response** (success): `{pr_title, pr_html_url, review, slack_posted, slack_error?}`.
 **Response** (error): `{"error": "<message>"}` — AgentCore's contract always
@@ -106,6 +111,33 @@ change on the `api_server` side is needed. `adlc-review-agent` is already
 one of the slugs `api_server` recognizes as deployable
 (`service.SupportedDeploymentAgentSlugs`); a new agent added to this repo
 needs an entry there too before it can be deployed from the Labs UI.
+
+### Deploying as Meko's shared instance
+
+Unlike a per-user dedicated deployment (created through the Labs UI, tracked
+in Meko's own `deployments` table, invoked with the calling user's own
+`meko_pat`), the one shared instance every signed-in Meko user can invoke
+without deploying their own is created and operated entirely outside Meko —
+by hand, via the AWS CLI — and authenticates with its own baked-in
+credential instead of a per-request PAT:
+
+```bash
+aws bedrock-agentcore-control create-agent-runtime \
+  --agent-runtime-name meko_agentk_shared \
+  --agent-runtime-artifact '{"containerConfiguration":{"containerUri":"{MEKO_LABS_AGENT_IMAGES_REPO}/adlc-review-agent:latest"}}' \
+  --role-arn <meko's managed AgentCore execution role arn> \
+  --network-configuration networkMode=PUBLIC \
+  --environment-variables MEKO_PAT=<a PAT for the account the datapack gets shared with> \
+  --region us-east-1
+```
+
+Poll `get-agent-runtime` until `status: READY`, then register the resulting
+`agentRuntimeArn` in `meko_system.shared_deployments` (keyed by `agent_slug`)
+so `GET/POST /deployments/shared/:agent_slug*` can find it — see
+`api_server`'s own docs for that table. `MEKO_PAT` is read by
+`agentcore_entrypoint.py`'s `_resolve_meko_pat` only when the invoking
+payload has no `meko_pat` of its own, which is exactly what
+`invokeSharedDeployment` (meko_ui) sends.
 
 ## Development
 
