@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from unittest.mock import MagicMock, patch
 
-from adlc_review_agent.agentcore_entrypoint import DEFAULT_MEKO_MCP_URL, handler
+from adlc_review_agent.agentcore_entrypoint import DEFAULT_BEDROCK_MODEL, DEFAULT_MEKO_MCP_URL, handler
 from adlc_review_agent.github_client import GitHubApiError, PullRequest
 from adlc_review_agent.slack_client import SlackApiError
 
@@ -186,6 +186,41 @@ def test_handler_payload_meko_mcp_url_wins_over_env_var(
 
     assert events[-1]["review"] == "Looks fine."
     mock_meko_cls.assert_called_once_with(server_url="https://mcp.example-override.ai/mcp", pat="mko_tkn_fake")
+
+
+@_patched
+def test_handler_defaults_to_bedrock_shaped_model(
+    mock_anthropic_bedrock, mock_fetch_pr, mock_meko_cls, mock_create_conversation, mock_run_review_stream, mock_post,
+) -> None:
+    # AnthropicBedrock rejects review.py's plain-API DEFAULT_MODEL string
+    # ("claude-sonnet-4-5-20250929") with a 400 "invalid model identifier" --
+    # this entrypoint always uses AnthropicBedrock, so it must never fall
+    # through to that default.
+    mock_fetch_pr.return_value = PullRequest(title="Add endpoint", html_url="https://x", diff="+ x = 1")
+    mock_meko_cls.return_value.__enter__.return_value = MagicMock()
+    mock_create_conversation.return_value = "conv-1"
+    mock_run_review_stream.return_value = iter([{"type": "done", "text": "Looks fine.", "kb_context": "(none found)"}])
+
+    events = _events(dict(_BASE_PAYLOAD))
+
+    assert events[-1]["review"] == "Looks fine."
+    assert mock_run_review_stream.call_args.kwargs["model"] == DEFAULT_BEDROCK_MODEL
+
+
+@_patched
+def test_handler_payload_model_overrides_bedrock_default(
+    mock_anthropic_bedrock, mock_fetch_pr, mock_meko_cls, mock_create_conversation, mock_run_review_stream, mock_post,
+) -> None:
+    mock_fetch_pr.return_value = PullRequest(title="Add endpoint", html_url="https://x", diff="+ x = 1")
+    mock_meko_cls.return_value.__enter__.return_value = MagicMock()
+    mock_create_conversation.return_value = "conv-1"
+    mock_run_review_stream.return_value = iter([{"type": "done", "text": "Looks fine.", "kb_context": "(none found)"}])
+
+    payload = {**_BASE_PAYLOAD, "model": "anthropic.claude-opus-4-1-20250805-v1:0"}
+    events = _events(payload)
+
+    assert events[-1]["review"] == "Looks fine."
+    assert mock_run_review_stream.call_args.kwargs["model"] == "anthropic.claude-opus-4-1-20250805-v1:0"
 
 
 def test_handler_slack_channel_required_with_slack_token() -> None:

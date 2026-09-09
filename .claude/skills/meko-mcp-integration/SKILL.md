@@ -4,14 +4,17 @@ description: >-
   How a canned agent in this repo should call Meko's MCP tools correctly —
   the conversation lifecycle (conversation_create then thread conversation_id
   through every subsequent call), resolving the right MCP endpoint for the
-  deployment's environment instead of defaulting to prod, and the
-  payload-PAT-vs-baked-in-PAT credential pattern. Read this before writing or
-  reviewing any code in this repo that calls `meko_client`/Meko's `/mcp`
-  endpoint directly, and before debugging a `MekoMcpError` or a tool
-  validation error. Every rule here was a real bug found and fixed in
-  `adlc-review-agent` (see canned-agents#3) — the point of this file is that
-  the next agent shouldn't have to rediscover them one AgentCore invoke at a
-  time.
+  deployment's environment instead of defaulting to prod, the
+  payload-PAT-vs-baked-in-PAT credential pattern, and the same
+  payload/env-var/default precedence applied to an AgentCore entrypoint's
+  Bedrock model id (which uses a different format than the plain Anthropic
+  API). Read this before writing or reviewing any code in this repo that
+  calls `meko_client`/Meko's `/mcp` endpoint directly or constructs an
+  `AnthropicBedrock` client, and before debugging a `MekoMcpError`, a tool
+  validation error, or a Bedrock "invalid model identifier" error. Every rule
+  here was a real bug found and fixed in `adlc-review-agent` (see
+  canned-agents#3) — the point of this file is that the next agent shouldn't
+  have to rediscover them one AgentCore invoke at a time.
 ---
 
 # meko-mcp-integration
@@ -73,6 +76,26 @@ container env var baked in at deploy time (a shared instance every user can
 invoke authenticates with its own fixed identity instead of a forwarded
 per-user token). Never invert this — a shared instance must not fall back to
 some ambient per-user credential it was never handed.
+
+## `AnthropicBedrock` needs a Bedrock-shaped model id, not the plain Anthropic one
+
+`review.py`'s `DEFAULT_MODEL` (e.g. `"claude-sonnet-4-5-20250929"`) is what
+`cli.py`'s plain `Anthropic(api_key=...)` client expects. `AnthropicBedrock()`
+— what every AgentCore entrypoint uses — rejects that exact string with
+`BadRequestError: ... 'The provided model identifier is invalid.'` (400). The
+Bedrock-shaped id looks like `anthropic.claude-sonnet-4-5-20250929-v1:0`
+(confirm the exact id for your target region/account with `aws bedrock
+list-foundation-models`, since it can be a cross-region inference-profile id
+instead, e.g. `us.anthropic....`).
+
+**Don't fix this by changing `DEFAULT_MODEL`** — `run_review_stream`/
+`run_followup_stream`/`cli.py` share that constant, so repointing it at a
+Bedrock id would silently break the CLI's plain-Anthropic path. Instead give
+the AgentCore entrypoint its own resolver, same precedence as
+`_resolve_meko_mcp_url`/`_resolve_meko_pat` (payload override, then a
+deploy-time env var, then a hardcoded Bedrock-shaped default), and pass the
+result as an explicit `model=` kwarg into `run_review_stream`/
+`run_followup_stream` rather than relying on their shared default.
 
 ## Debugging playbook for a `MekoMcpError` / tool validation error
 
