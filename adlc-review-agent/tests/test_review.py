@@ -22,8 +22,8 @@ class _FakeMeko:
         self.tool_calls: list[tuple[str, dict[str, Any]]] = []
         self._next_conversation_id = 1
 
-    def knowledgebase_search(self, *, query: str, datapack_id: str) -> dict[str, Any]:
-        self.calls.append({"query": query, "datapack_id": datapack_id})
+    def knowledgebase_search(self, *, query: str, conversation_id: str, datapack_id: str) -> dict[str, Any]:
+        self.calls.append({"query": query, "conversation_id": conversation_id, "datapack_id": datapack_id})
         return self.kb_result
 
     def call_tool(self, name: str, arguments: dict[str, Any]) -> Any:
@@ -98,7 +98,9 @@ def test_run_review_grounds_prompt_in_kb_hits_and_returns_llm_text() -> None:
 
     assert result.text == "Looks like a bare except on line 20."
     assert "no bare except" in result.kb_context
-    assert meko.calls == [{"query": "coding standards security requirements", "datapack_id": "dp-1"}]
+    assert meko.calls == [
+        {"query": "coding standards security requirements", "conversation_id": "conv-2", "datapack_id": "dp-1"}
+    ]
 
     # The KB context and the diff both made it into the LLM call.
     call_kwargs = anthropic_client.messages.stream.call_args.kwargs

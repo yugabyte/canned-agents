@@ -228,7 +228,9 @@ def run_review_stream(
     kb_context = "(knowledge base search disabled for this review)"
     if config.enable_knowledge_base:
         kb_result = meko.knowledgebase_search(
-            query="coding standards security requirements", datapack_id=datapack_id
+            query="coding standards security requirements",
+            conversation_id=conversation_id,
+            datapack_id=datapack_id,
         )
         kb_context = _format_kb_hits(kb_result)
 
