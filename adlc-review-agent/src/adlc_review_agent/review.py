@@ -18,12 +18,87 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Iterator, Literal, Optional
 
+import boto3
 from anthropic import Anthropic
 
 from .meko_client import MekoMcpClient
 
 DEFAULT_MODEL = "claude-sonnet-4-5-20250929"
 AGENT_ID = "adlc-review-agent"
+
+_bedrock_runtime: Any = None
+
+
+def _get_bedrock_runtime() -> Any:
+    """Lazy singleton -- only constructed the first time a non-Anthropic
+    model is actually used, so this stays a no-op (no AWS client, no region
+    lookup) for the Claude-only path every existing caller (CLI, tests) uses."""
+    global _bedrock_runtime
+    if _bedrock_runtime is None:
+        _bedrock_runtime = boto3.client("bedrock-runtime")
+    return _bedrock_runtime
+
+
+def _is_anthropic_model(model: str) -> bool:
+    """True for any Claude/Anthropic model id, in any of its forms: the
+    plain Anthropic API format cli.py's Anthropic() client uses
+    ("claude-sonnet-4-5-20250929"), or Bedrock's format, bare or
+    cross-region-inference-profile-prefixed ("anthropic.claude-...-v1:0",
+    "us.anthropic.claude-...-v1:0"). False for anything else (Mistral/
+    Llama/Nova/...), which needs Bedrock's Converse API instead."""
+    return "claude" in model.lower()
+
+
+def _stream_llm_response(
+    *, anthropic_client: Anthropic, model: str, system: str, user_content: str
+) -> Iterator[dict[str, Any]]:
+    """Yields `{"type": "text_delta", "text": ...}` chunks, then a final
+    `{"type": "usage", "input_tokens": ..., "output_tokens": ...}`.
+
+    `AnthropicBedrock` (what every caller here passes as `anthropic_client`)
+    always translates a call into Anthropic's own Messages API body shape
+    (`system`/`messages`/`anthropic_version`) before routing it to Bedrock's
+    per-model invoke endpoint -- that shape is only understood by Claude
+    models. A non-Anthropic model id (Mistral/Llama/Nova, picked from Labs'
+    "Run a Review" model dropdown) needs Bedrock's own model-agnostic
+    Converse API instead; sending it through AnthropicBedrock fails with
+    `anthropic.BadRequestError: ... 'The provided model identifier is
+    invalid.'` regardless of whether the id string itself is correct, since
+    the request body it sends is the wrong shape for that model family."""
+    if _is_anthropic_model(model):
+        with anthropic_client.messages.stream(
+            model=model,
+            max_tokens=2000,
+            system=system,
+            messages=[{"role": "user", "content": user_content}],
+        ) as stream:
+            for text in stream.text_stream:
+                yield {"type": "text_delta", "text": text}
+            # get_final_message() must be called before the `with` block
+            # exits -- it waits on the stream's own completion, which
+            # `__exit__` also does, but calling it after exit risks the
+            # underlying connection already being torn down.
+            usage = stream.get_final_message().usage
+        yield {"type": "usage", "input_tokens": usage.input_tokens, "output_tokens": usage.output_tokens}
+        return
+
+    response = _get_bedrock_runtime().converse_stream(
+        modelId=model,
+        system=[{"text": system}],
+        messages=[{"role": "user", "content": [{"text": user_content}]}],
+        inferenceConfig={"maxTokens": 2000},
+    )
+    for event in response["stream"]:
+        delta = event.get("contentBlockDelta", {}).get("delta", {})
+        if "text" in delta:
+            yield {"type": "text_delta", "text": delta["text"]}
+        metadata_usage = event.get("metadata", {}).get("usage")
+        if metadata_usage:
+            yield {
+                "type": "usage",
+                "input_tokens": metadata_usage["inputTokens"],
+                "output_tokens": metadata_usage["outputTokens"],
+            }
 
 ReviewTone = Literal["concise", "detailed", "encouraging"]
 ReviewStrictness = Literal["lenient", "balanced", "strict"]
@@ -164,6 +239,8 @@ def _format_memory_hits(mem_result: Any) -> str:
 class ReviewResult:
     text: str
     kb_context: str
+    input_tokens: int
+    output_tokens: int
 
 
 @dataclass
@@ -258,19 +335,19 @@ def run_review_stream(
     user_content = f"Title: {pr_title}\n\n```diff\n{pr_diff}\n```"
 
     full_text_parts: list[str] = []
-    with anthropic_client.messages.stream(
-        model=model,
-        max_tokens=2000,
-        system=system,
-        messages=[{"role": "user", "content": user_content}],
-    ) as stream:
-        for text in stream.text_stream:
-            full_text_parts.append(text)
-            yield {"type": "text_delta", "text": text}
+    usage = {"input_tokens": 0, "output_tokens": 0}
+    for event in _stream_llm_response(
+        anthropic_client=anthropic_client, model=model, system=system, user_content=user_content
+    ):
+        if event["type"] == "text_delta":
+            full_text_parts.append(event["text"])
+            yield event
+        else:
+            usage = {"input_tokens": event["input_tokens"], "output_tokens": event["output_tokens"]}
 
     full_text = "".join(full_text_parts)
     _add_message(meko, conversation_id=conversation_id, datapack_id=datapack_id, input_text=user_content, output_text=full_text)
-    yield {"type": "done", "text": full_text, "kb_context": kb_context}
+    yield {"type": "done", "text": full_text, "kb_context": kb_context, "usage": usage}
 
 
 def run_followup_stream(
@@ -297,19 +374,19 @@ def run_followup_stream(
     )
 
     full_text_parts: list[str] = []
-    with anthropic_client.messages.stream(
-        model=model,
-        max_tokens=2000,
-        system=system,
-        messages=[{"role": "user", "content": question}],
-    ) as stream:
-        for text in stream.text_stream:
-            full_text_parts.append(text)
-            yield {"type": "text_delta", "text": text}
+    usage = {"input_tokens": 0, "output_tokens": 0}
+    for event in _stream_llm_response(
+        anthropic_client=anthropic_client, model=model, system=system, user_content=question
+    ):
+        if event["type"] == "text_delta":
+            full_text_parts.append(event["text"])
+            yield event
+        else:
+            usage = {"input_tokens": event["input_tokens"], "output_tokens": event["output_tokens"]}
 
     full_text = "".join(full_text_parts)
     _add_message(meko, conversation_id=conversation_id, datapack_id=datapack_id, input_text=question, output_text=full_text)
-    yield {"type": "done", "text": full_text}
+    yield {"type": "done", "text": full_text, "usage": usage}
 
 
 def run_review(
@@ -330,6 +407,7 @@ def run_review(
     conversation_id = _create_conversation(meko, datapack_id, title=f"Review: {pr_title}")
     full_text = ""
     kb_context = ""
+    usage = {"input_tokens": 0, "output_tokens": 0}
     for event in run_review_stream(
         meko=meko,
         anthropic_client=anthropic_client,
@@ -343,4 +421,10 @@ def run_review(
         if event["type"] == "done":
             full_text = event["text"]
             kb_context = event["kb_context"]
-    return ReviewResult(text=full_text, kb_context=kb_context)
+            usage = event["usage"]
+    return ReviewResult(
+        text=full_text,
+        kb_context=kb_context,
+        input_tokens=usage["input_tokens"],
+        output_tokens=usage["output_tokens"],
+    )

@@ -2,10 +2,11 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Any
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 from adlc_review_agent.review import (
     ReviewConfig,
+    _is_anthropic_model,
     _render_focus_block,
     _render_tone_strictness_block,
     run_followup_stream,
@@ -44,12 +45,25 @@ class _TextBlock:
     text: str
 
 
+@dataclass
+class _Usage:
+    input_tokens: int
+    output_tokens: int
+
+
+@dataclass
+class _FinalMessage:
+    usage: _Usage
+
+
 class _FakeMessageStream:
     """Mimics anthropic's `with client.messages.stream(...) as stream:`
-    context manager: `.text_stream` yields chunks of `reply_text`."""
+    context manager: `.text_stream` yields chunks of `reply_text`, and
+    `get_final_message().usage` returns the fixed token counts passed in."""
 
-    def __init__(self, reply_text: str) -> None:
+    def __init__(self, reply_text: str, input_tokens: int, output_tokens: int) -> None:
         self.reply_text = reply_text
+        self._usage = _Usage(input_tokens=input_tokens, output_tokens=output_tokens)
 
     def __enter__(self) -> "_FakeMessageStream":
         return self
@@ -66,10 +80,13 @@ class _FakeMessageStream:
             if chunk:
                 yield chunk
 
+    def get_final_message(self) -> _FinalMessage:
+        return _FinalMessage(usage=self._usage)
 
-def _fake_anthropic(reply_text: str) -> MagicMock:
+
+def _fake_anthropic(reply_text: str, *, input_tokens: int = 100, output_tokens: int = 50) -> MagicMock:
     client = MagicMock()
-    client.messages.stream.return_value = _FakeMessageStream(reply_text)
+    client.messages.stream.return_value = _FakeMessageStream(reply_text, input_tokens, output_tokens)
     return client
 
 
@@ -86,7 +103,7 @@ def _drain(events) -> tuple[list[str], dict[str, Any]]:
 
 def test_run_review_grounds_prompt_in_kb_hits_and_returns_llm_text() -> None:
     meko = _FakeMeko({"results": [{"document_name": "standards.md", "chunk_text": "no bare except"}]})
-    anthropic_client = _fake_anthropic("Looks like a bare except on line 20.")
+    anthropic_client = _fake_anthropic("Looks like a bare except on line 20.", input_tokens=1234, output_tokens=321)
 
     result = run_review(
         meko=meko,  # type: ignore[arg-type]
@@ -98,6 +115,8 @@ def test_run_review_grounds_prompt_in_kb_hits_and_returns_llm_text() -> None:
 
     assert result.text == "Looks like a bare except on line 20."
     assert "no bare except" in result.kb_context
+    assert result.input_tokens == 1234
+    assert result.output_tokens == 321
     assert meko.calls == [
         {"query": "coding standards security requirements", "conversation_id": "conv-2", "datapack_id": "dp-1"}
     ]
@@ -147,6 +166,7 @@ def test_run_review_stream_yields_text_deltas_then_done() -> None:
     deltas, done = _drain(events)
     assert "".join(deltas) == "Hello world"
     assert done["text"] == "Hello world"
+    assert done["usage"] == {"input_tokens": 100, "output_tokens": 50}
     assert events[-1] is done
 
 
@@ -240,6 +260,7 @@ def test_followup_reuses_conversation_id_and_streams() -> None:
     deltas, done = _drain(events)
     assert "".join(deltas) == "It's a false positive."
     assert done["text"] == "It's a false positive."
+    assert done["usage"] == {"input_tokens": 100, "output_tokens": 50}
 
     # No conversation_create for a follow-up -- reuses the passed-in id.
     tool_names = [name for name, _ in meko.tool_calls]
@@ -250,3 +271,62 @@ def test_followup_reuses_conversation_id_and_streams() -> None:
 
     call_kwargs = anthropic_client.messages.stream.call_args.kwargs
     assert "Flagged a bare except on line 20." in call_kwargs["system"]
+
+
+def test_is_anthropic_model_recognizes_every_claude_id_shape() -> None:
+    # cli.py's plain Anthropic API format.
+    assert _is_anthropic_model("claude-sonnet-4-5-20250929") is True
+    # Bedrock, bare and cross-region-inference-profile forms.
+    assert _is_anthropic_model("anthropic.claude-sonnet-4-5-20250929-v1:0") is True
+    assert _is_anthropic_model("us.anthropic.claude-sonnet-4-5-20250929-v1:0") is True
+    # Non-Anthropic Bedrock models -- must route to Converse, not AnthropicBedrock.
+    assert _is_anthropic_model("mistral.ministral-3-14b-instruct") is False
+    assert _is_anthropic_model("meta.llama4-maverick-17b-instruct-v1:0") is False
+    assert _is_anthropic_model("amazon.nova-lite-v1:0") is False
+
+
+def _fake_converse_stream(text: str, *, input_tokens: int, output_tokens: int) -> dict[str, Any]:
+    mid = max(1, len(text) // 2)
+    return {
+        "stream": [
+            {"contentBlockDelta": {"delta": {"text": text[:mid]}}},
+            {"contentBlockDelta": {"delta": {"text": text[mid:]}}},
+            {"metadata": {"usage": {"inputTokens": input_tokens, "outputTokens": output_tokens}}},
+        ]
+    }
+
+
+def test_run_review_stream_routes_a_non_anthropic_model_through_converse() -> None:
+    # A model picked from Labs' SLM dropdown must never reach
+    # anthropic_client.messages.stream() -- that always sends Anthropic's
+    # Messages-API body shape, which a Mistral/Llama/Nova model on Bedrock
+    # rejects with "The provided model identifier is invalid." regardless
+    # of whether the id string itself is correct.
+    meko = _FakeMeko({"results": []})
+    anthropic_client = _fake_anthropic("should never be used")
+    fake_bedrock = MagicMock()
+    fake_bedrock.converse_stream.return_value = _fake_converse_stream(
+        "Looks fine for a small model.", input_tokens=812, output_tokens=214
+    )
+
+    with patch("adlc_review_agent.review._get_bedrock_runtime", return_value=fake_bedrock):
+        events = list(
+            run_review_stream(
+                meko=meko,  # type: ignore[arg-type]
+                anthropic_client=anthropic_client,
+                datapack_id="dp-1",
+                pr_title="Add endpoint",
+                pr_diff="+ x = 1",
+                conversation_id="conv-1",
+                model="mistral.ministral-3-14b-instruct",
+            )
+        )
+
+    deltas, done = _drain(events)
+    assert "".join(deltas) == "Looks fine for a small model."
+    assert done["usage"] == {"input_tokens": 812, "output_tokens": 214}
+    anthropic_client.messages.stream.assert_not_called()
+
+    call_kwargs = fake_bedrock.converse_stream.call_args.kwargs
+    assert call_kwargs["modelId"] == "mistral.ministral-3-14b-instruct"
+    assert call_kwargs["messages"][0]["content"][0]["text"].startswith("Title: Add endpoint")
