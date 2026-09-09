@@ -20,3 +20,8 @@ is (own `pyproject.toml`, `src/`, `tests/`, `README.md`, `Dockerfile`). To make
 it deployable from Meko's Labs UI, see `adlc-review-agent/README.md`'s
 "Deploying to AWS Bedrock AgentCore Runtime" section for the container
 contract and image-publishing convention every agent here follows.
+
+Before writing its Meko MCP client, read
+[`.claude/skills/meko-mcp-integration/SKILL.md`](.claude/skills/meko-mcp-integration/SKILL.md) —
+the conversation-lifecycle, MCP-endpoint-resolution, and credential rules
+every agent's client needs, each one a real bug found in `adlc-review-agent`.
