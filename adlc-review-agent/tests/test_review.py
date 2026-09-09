@@ -16,9 +16,15 @@ from adlc_review_agent.review import (
 
 
 class _FakeMeko:
-    def __init__(self, kb_result: dict[str, Any], mem_result: dict[str, Any] | None = None) -> None:
+    def __init__(
+        self,
+        kb_result: dict[str, Any],
+        mem_result: dict[str, Any] | None = None,
+        datapack_totals: dict[str, Any] | None = None,
+    ) -> None:
         self.kb_result = kb_result
         self.mem_result = mem_result or {"results": []}
+        self.datapack_totals = datapack_totals or {"knowledge_chunk_count": 70, "memory_count": 24}
         self.calls: list[dict[str, Any]] = []
         self.tool_calls: list[tuple[str, dict[str, Any]]] = []
         self._next_conversation_id = 1
@@ -36,6 +42,8 @@ class _FakeMeko:
             return self.mem_result
         if name == "conversation_add_message":
             return {"message_id": "msg-1"}
+        if name == "datapack_describe":
+            return self.datapack_totals
         raise AssertionError(f"unexpected tool call: {name}")
 
 
@@ -126,11 +134,17 @@ def test_run_review_grounds_prompt_in_kb_hits_and_returns_llm_text() -> None:
     assert "no bare except" in call_kwargs["system"]
     assert "except:" in call_kwargs["messages"][0]["content"]
 
-    # conversation_create then conversation_add_message, in that order.
+    # conversation_create, then conversation_add_message, then datapack_describe
+    # (for context_stats -- only after the message is written, not before).
     tool_names = [name for name, _ in meko.tool_calls]
-    assert tool_names == ["conversation_create", "conversation_add_message"]
+    assert tool_names == ["conversation_create", "conversation_add_message", "datapack_describe"]
     add_message_args = meko.tool_calls[1][1]
     assert add_message_args["output"] == "Looks like a bare except on line 20."
+
+    assert result.context_stats["kb_chunks_retrieved"] == 1
+    assert result.context_stats["kb_chunks_total"] == 70
+    assert result.context_stats["memories_retrieved"] == 0
+    assert result.context_stats["memories_total"] == 24
 
 
 def test_run_review_handles_empty_knowledge_base() -> None:
@@ -189,6 +203,74 @@ def test_run_review_respects_enable_knowledge_base_false() -> None:
     assert meko.calls == []  # knowledgebase_search never called
     call_kwargs = anthropic_client.messages.stream.call_args.kwargs
     assert "should not be used" not in call_kwargs["system"]
+
+
+def test_context_stats_skips_datapack_describe_when_nothing_retrieved() -> None:
+    # No point spending a call on totals if neither tool ran -- there's
+    # nothing to show a retrieved/total ratio for.
+    meko = _FakeMeko({"results": []})
+    anthropic_client = _fake_anthropic("Reviewed without any retrieval.")
+
+    events = list(
+        run_review_stream(
+            meko=meko,  # type: ignore[arg-type]
+            anthropic_client=anthropic_client,
+            datapack_id="dp-1",
+            pr_title="Add endpoint",
+            pr_diff="+ x = 1",
+            conversation_id="conv-1",
+            config=ReviewConfig(enable_knowledge_base=False, enable_memory_search=False),
+        )
+    )
+
+    tool_names = [name for name, _ in meko.tool_calls]
+    assert "datapack_describe" not in tool_names
+
+    _, done = _drain(events)
+    assert done["context_stats"] == {
+        "kb_chunks_retrieved": 0,
+        "kb_chunks_total": None,
+        "kb_tokens_estimated": 0,
+        "memories_retrieved": 0,
+        "memories_total": None,
+        "memory_tokens_estimated": 0,
+    }
+
+
+def test_context_stats_token_estimate_is_proportional_to_real_usage() -> None:
+    # No exact per-section tokenizer is available through Bedrock for either
+    # client -- the estimate is each blob's share of the real captured
+    # input_tokens, proportional to its share of the system prompt's chars.
+    meko = _FakeMeko(
+        {"results": [{"document_name": "standards.md", "chunk_text": "x" * 100}]},
+        mem_result={"results": [{"memory": "y" * 50}]},
+        datapack_totals={"knowledge_chunk_count": 70, "memory_count": 24},
+    )
+    anthropic_client = _fake_anthropic("Reviewed with both.", input_tokens=1000, output_tokens=50)
+
+    events = list(
+        run_review_stream(
+            meko=meko,  # type: ignore[arg-type]
+            anthropic_client=anthropic_client,
+            datapack_id="dp-1",
+            pr_title="Add endpoint",
+            pr_diff="+ x = 1",
+            conversation_id="conv-1",
+            config=ReviewConfig(enable_knowledge_base=True, enable_memory_search=True),
+        )
+    )
+
+    _, done = _drain(events)
+    stats = done["context_stats"]
+    assert stats["kb_chunks_retrieved"] == 1
+    assert stats["kb_chunks_total"] == 70
+    assert stats["memories_retrieved"] == 1
+    assert stats["memories_total"] == 24
+    # kb_context (built from the 100-char chunk) is longer than memory_context
+    # (built from the 50-char memory), so its estimated share of the real
+    # 1000 input_tokens must be larger.
+    assert stats["kb_tokens_estimated"] > stats["memory_tokens_estimated"] > 0
+    assert stats["kb_tokens_estimated"] < 1000
 
 
 def test_run_review_respects_enable_memory_search() -> None:

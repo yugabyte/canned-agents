@@ -21,7 +21,7 @@ from typing import Any, Iterator, Literal, Optional
 import boto3
 from anthropic import Anthropic
 
-from .meko_client import MekoMcpClient
+from .meko_client import MekoMcpClient, MekoMcpError
 
 DEFAULT_MODEL = "claude-sonnet-4-5-20250929"
 AGENT_ID = "adlc-review-agent"
@@ -241,6 +241,7 @@ class ReviewResult:
     kb_context: str
     input_tokens: int
     output_tokens: int
+    context_stats: dict[str, Any]
 
 
 @dataclass
@@ -287,6 +288,54 @@ def _add_message(meko: MekoMcpClient, *, conversation_id: str, datapack_id: str,
     )
 
 
+def _build_context_stats(
+    *,
+    meko: MekoMcpClient,
+    datapack_id: str,
+    conversation_id: str,
+    kb_context: str,
+    kb_chunks_retrieved: int,
+    memory_context: str,
+    memories_retrieved: int,
+    system: str,
+    total_input_tokens: int,
+) -> dict[str, Any]:
+    """Real retrieved-vs-total counts (from `datapack_describe`, which already
+    tracks them for the whole datapack), plus an estimated per-tool token
+    split. There's no exact per-section token count available -- Bedrock
+    rejects a pre-call tokenizer request for both AnthropicBedrock
+    (`/v1/messages/count_tokens` raises "not supported in Bedrock yet") and
+    the Converse API used for non-Claude models -- so the split is each
+    context blob's share of the real captured `total_input_tokens`,
+    proportional to its share of the system prompt's character count. That's
+    an estimate, not an exact count, but it's anchored to a real total rather
+    than fabricated outright."""
+    totals: dict[str, Any] = {}
+    if kb_chunks_retrieved or memories_retrieved:
+        try:
+            totals = meko.call_tool(
+                "datapack_describe", {"datapack_id": datapack_id, "conversation_id": conversation_id}
+            ) or {}
+        except MekoMcpError:
+            totals = {}
+
+    # Gated on chunks/memories actually retrieved, not just non-empty text --
+    # kb_context/memory_context hold a fixed placeholder string ("...disabled
+    # for this review") when the tool never ran, which would otherwise get
+    # counted as if it were real (small but nonzero) retrieved content.
+    total_chars = max(len(system), 1)
+    return {
+        "kb_chunks_retrieved": kb_chunks_retrieved,
+        "kb_chunks_total": totals.get("knowledge_chunk_count"),
+        "kb_tokens_estimated": round(total_input_tokens * len(kb_context) / total_chars) if kb_chunks_retrieved else 0,
+        "memories_retrieved": memories_retrieved,
+        "memories_total": totals.get("memory_count"),
+        "memory_tokens_estimated": (
+            round(total_input_tokens * len(memory_context) / total_chars) if memories_retrieved else 0
+        ),
+    }
+
+
 def run_review_stream(
     *,
     meko: MekoMcpClient,
@@ -303,6 +352,7 @@ def run_review_stream(
     full_text, "kb_context": ...}`. Writes the turn to `conversation_id` via
     conversation_add_message once the full text is known."""
     kb_context = "(knowledge base search disabled for this review)"
+    kb_chunks_retrieved = 0
     if config.enable_knowledge_base:
         kb_result = meko.knowledgebase_search(
             query="coding standards security requirements",
@@ -310,8 +360,10 @@ def run_review_stream(
             datapack_id=datapack_id,
         )
         kb_context = _format_kb_hits(kb_result)
+        kb_chunks_retrieved = len((kb_result or {}).get("results") or [])
 
     memory_context = "(memory search disabled for this review)"
+    memories_retrieved = 0
     if config.enable_memory_search:
         mem_result = meko.call_tool(
             "memory_search",
@@ -325,6 +377,7 @@ def run_review_stream(
             },
         )
         memory_context = _format_memory_hits(mem_result)
+        memories_retrieved = len((mem_result or {}).get("results") or [])
 
     system = REVIEW_SYSTEM_PROMPT.format(
         kb_context=kb_context,
@@ -347,7 +400,24 @@ def run_review_stream(
 
     full_text = "".join(full_text_parts)
     _add_message(meko, conversation_id=conversation_id, datapack_id=datapack_id, input_text=user_content, output_text=full_text)
-    yield {"type": "done", "text": full_text, "kb_context": kb_context, "usage": usage}
+    context_stats = _build_context_stats(
+        meko=meko,
+        datapack_id=datapack_id,
+        conversation_id=conversation_id,
+        kb_context=kb_context,
+        kb_chunks_retrieved=kb_chunks_retrieved,
+        memory_context=memory_context,
+        memories_retrieved=memories_retrieved,
+        system=system,
+        total_input_tokens=usage["input_tokens"],
+    )
+    yield {
+        "type": "done",
+        "text": full_text,
+        "kb_context": kb_context,
+        "usage": usage,
+        "context_stats": context_stats,
+    }
 
 
 def run_followup_stream(
@@ -408,6 +478,7 @@ def run_review(
     full_text = ""
     kb_context = ""
     usage = {"input_tokens": 0, "output_tokens": 0}
+    context_stats: dict[str, Any] = {}
     for event in run_review_stream(
         meko=meko,
         anthropic_client=anthropic_client,
@@ -422,9 +493,11 @@ def run_review(
             full_text = event["text"]
             kb_context = event["kb_context"]
             usage = event["usage"]
+            context_stats = event["context_stats"]
     return ReviewResult(
         text=full_text,
         kb_context=kb_context,
         input_tokens=usage["input_tokens"],
         output_tokens=usage["output_tokens"],
+        context_stats=context_stats,
     )
