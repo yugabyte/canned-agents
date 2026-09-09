@@ -148,6 +148,46 @@ def test_handler_falls_back_to_meko_pat_env_var(
     mock_meko_cls.assert_called_once_with(server_url=DEFAULT_MEKO_MCP_URL, pat="mko_tkn_from_env")
 
 
+@_patched
+def test_handler_falls_back_to_meko_mcp_url_env_var(
+    mock_anthropic_bedrock, mock_fetch_pr, mock_meko_cls, mock_create_conversation, mock_run_review_stream, mock_post,
+    monkeypatch,
+) -> None:
+    # A deployed container's own MEKO_MCP_URL, baked in at deploy time, must
+    # win over the hardcoded prod default when the payload has none of its
+    # own -- otherwise a dev-deployed shared instance silently talks to prod
+    # and every datapack-scoped MCP call 404s.
+    monkeypatch.setenv("MEKO_MCP_URL", "https://mcp.mekodev.com/mcp")
+    mock_fetch_pr.return_value = PullRequest(title="Add endpoint", html_url="https://x", diff="+ x = 1")
+    mock_meko_cls.return_value.__enter__.return_value = MagicMock()
+    mock_create_conversation.return_value = "conv-1"
+    mock_run_review_stream.return_value = iter([{"type": "done", "text": "Looks fine.", "kb_context": "(none found)"}])
+
+    payload = dict(_BASE_PAYLOAD)
+    events = _events(payload)
+
+    assert events[-1]["review"] == "Looks fine."
+    mock_meko_cls.assert_called_once_with(server_url="https://mcp.mekodev.com/mcp", pat="mko_tkn_fake")
+
+
+@_patched
+def test_handler_payload_meko_mcp_url_wins_over_env_var(
+    mock_anthropic_bedrock, mock_fetch_pr, mock_meko_cls, mock_create_conversation, mock_run_review_stream, mock_post,
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("MEKO_MCP_URL", "https://mcp.mekodev.com/mcp")
+    mock_fetch_pr.return_value = PullRequest(title="Add endpoint", html_url="https://x", diff="+ x = 1")
+    mock_meko_cls.return_value.__enter__.return_value = MagicMock()
+    mock_create_conversation.return_value = "conv-1"
+    mock_run_review_stream.return_value = iter([{"type": "done", "text": "Looks fine.", "kb_context": "(none found)"}])
+
+    payload = {**_BASE_PAYLOAD, "meko_mcp_url": "https://mcp.example-override.ai/mcp"}
+    events = _events(payload)
+
+    assert events[-1]["review"] == "Looks fine."
+    mock_meko_cls.assert_called_once_with(server_url="https://mcp.example-override.ai/mcp", pat="mko_tkn_fake")
+
+
 def test_handler_slack_channel_required_with_slack_token() -> None:
     events = _events({**_BASE_PAYLOAD, "slack_token": "xoxb-fake"})
 

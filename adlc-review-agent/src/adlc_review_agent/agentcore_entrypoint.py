@@ -72,6 +72,14 @@ def _resolve_meko_pat(payload: dict) -> str:
     return pat
 
 
+def _resolve_meko_mcp_url(payload: dict) -> str:
+    """Same precedence as _resolve_meko_pat: an explicit per-request override
+    in the payload wins, else the container's own MEKO_MCP_URL (baked in at
+    deploy time so a dev-deployed container talks to dev's MCP server rather
+    than silently defaulting to prod), else the hardcoded prod default."""
+    return payload.get("meko_mcp_url") or os.environ.get("MEKO_MCP_URL") or DEFAULT_MEKO_MCP_URL
+
+
 def _resolve_pr(payload: dict) -> tuple[str, str, str | None]:
     """Returns (title, diff, html_url). Two modes: `pr_title`+`pr_diff`
     directly (covers the bundled "sample diff" case, which has no real PR
@@ -110,7 +118,7 @@ def handler(payload: dict) -> dict | Iterator[dict[str, Any]]:
     try:
         datapack_id = _require(payload, "datapack_id")
         meko_pat = _resolve_meko_pat(payload)
-        meko_mcp_url = payload.get("meko_mcp_url") or DEFAULT_MEKO_MCP_URL
+        meko_mcp_url = _resolve_meko_mcp_url(payload)
         config = _parse_review_config(payload)
 
         if is_followup:
