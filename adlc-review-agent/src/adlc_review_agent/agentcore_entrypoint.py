@@ -42,6 +42,13 @@ from .slack_client import SlackApiError, post_to_channel
 
 DEFAULT_MEKO_MCP_URL = "https://mcp.mekodata.ai/mcp"
 
+# Bedrock model IDs use a different format than the plain Anthropic API --
+# review.py's DEFAULT_MODEL ("claude-sonnet-4-5-20250929") is what cli.py's
+# plain Anthropic() client expects, but AnthropicBedrock rejects that string
+# with "The provided model identifier is invalid." (400). This entrypoint
+# always uses AnthropicBedrock, so it needs its own, Bedrock-shaped default.
+DEFAULT_BEDROCK_MODEL = "anthropic.claude-sonnet-4-5-20250929-v1:0"
+
 app = BedrockAgentCoreApp()
 
 
@@ -70,6 +77,23 @@ def _resolve_meko_pat(payload: dict) -> str:
     if not pat:
         raise InvocationError("Missing required field: meko_pat")
     return pat
+
+
+def _resolve_meko_mcp_url(payload: dict) -> str:
+    """Same precedence as _resolve_meko_pat: an explicit per-request override
+    in the payload wins, else the container's own MEKO_MCP_URL (baked in at
+    deploy time so a dev-deployed container talks to dev's MCP server rather
+    than silently defaulting to prod), else the hardcoded prod default."""
+    return payload.get("meko_mcp_url") or os.environ.get("MEKO_MCP_URL") or DEFAULT_MEKO_MCP_URL
+
+
+def _resolve_bedrock_model(payload: dict) -> str:
+    """Same precedence as _resolve_meko_pat/_resolve_meko_mcp_url: a
+    per-request override in the payload wins, else the container's own
+    BEDROCK_MODEL env var (in case the account's available model or
+    inference-profile id differs by region/account), else the hardcoded
+    default."""
+    return payload.get("model") or os.environ.get("BEDROCK_MODEL") or DEFAULT_BEDROCK_MODEL
 
 
 def _resolve_pr(payload: dict) -> tuple[str, str, str | None]:
@@ -110,7 +134,8 @@ def handler(payload: dict) -> dict | Iterator[dict[str, Any]]:
     try:
         datapack_id = _require(payload, "datapack_id")
         meko_pat = _resolve_meko_pat(payload)
-        meko_mcp_url = payload.get("meko_mcp_url") or DEFAULT_MEKO_MCP_URL
+        meko_mcp_url = _resolve_meko_mcp_url(payload)
+        model = _resolve_bedrock_model(payload)
         config = _parse_review_config(payload)
 
         if is_followup:
@@ -136,6 +161,7 @@ def handler(payload: dict) -> dict | Iterator[dict[str, Any]]:
             prior_review_text=prior_review_text,
             question=question,
             config=config,
+            model=model,
         )
     return _stream_review(
         meko_mcp_url=meko_mcp_url,
@@ -147,6 +173,7 @@ def handler(payload: dict) -> dict | Iterator[dict[str, Any]]:
         config=config,
         slack_token=slack_token,
         slack_channel=slack_channel,
+        model=model,
     )
 
 
@@ -161,6 +188,7 @@ def _stream_review(
     config: ReviewConfig,
     slack_token: str | None,
     slack_channel: str | None,
+    model: str,
 ) -> Iterator[dict[str, Any]]:
     with MekoMcpClient(server_url=meko_mcp_url, pat=meko_pat) as meko:
         conversation_id = _create_conversation(meko, datapack_id, title=f"Review: {pr_title}")
@@ -180,6 +208,7 @@ def _stream_review(
             pr_diff=pr_diff,
             conversation_id=conversation_id,
             config=config,
+            model=model,
         ):
             if event["type"] == "text_delta":
                 yield event
@@ -216,6 +245,7 @@ def _stream_followup(
     prior_review_text: str,
     question: str,
     config: ReviewConfig,
+    model: str,
 ) -> Iterator[dict[str, Any]]:
     with MekoMcpClient(server_url=meko_mcp_url, pat=meko_pat) as meko:
         yield {"type": "meta", "conversation_id": conversation_id}
@@ -229,6 +259,7 @@ def _stream_followup(
             prior_review_text=prior_review_text,
             question=question,
             config=config,
+            model=model,
         ):
             if event["type"] == "text_delta":
                 yield event

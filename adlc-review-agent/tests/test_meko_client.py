@@ -33,13 +33,14 @@ def test_knowledgebase_search_initializes_then_calls_tool() -> None:
         if body["method"] == "tools/call":
             assert body["params"]["name"] == "knowledgebase_search"
             assert body["params"]["arguments"]["datapack_id"] == "dp-1"
+            assert body["params"]["arguments"]["conversation_id"] == "conv-1"
             return _tool_result_response(body["id"], {"results": [{"chunk_text": "no bare except"}]})
         raise AssertionError(f"unexpected method {body['method']}")
 
     respx.post(SERVER_URL).mock(side_effect=handler)
 
     with MekoMcpClient(server_url=SERVER_URL, pat="mko_tkn_fake") as client:
-        result = client.knowledgebase_search(query="coding standards", datapack_id="dp-1")
+        result = client.knowledgebase_search(query="coding standards", conversation_id="conv-1", datapack_id="dp-1")
 
     assert result == {"results": [{"chunk_text": "no bare except"}]}
 
@@ -65,7 +66,7 @@ def test_call_tool_raises_on_is_error() -> None:
 
     with MekoMcpClient(server_url=SERVER_URL, pat="mko_tkn_fake") as client:
         with pytest.raises(MekoMcpError, match="datapack not found"):
-            client.knowledgebase_search(query="x", datapack_id="missing")
+            client.knowledgebase_search(query="x", conversation_id="conv-1", datapack_id="missing")
 
 
 @respx.mock
@@ -93,6 +94,6 @@ def test_double_encoded_string_result_is_unwrapped() -> None:
     respx.post(SERVER_URL).mock(side_effect=handler)
 
     with MekoMcpClient(server_url=SERVER_URL, pat="mko_tkn_fake") as client:
-        result = client.knowledgebase_search(query="x", datapack_id="dp-1")
+        result = client.knowledgebase_search(query="x", conversation_id="conv-1", datapack_id="dp-1")
 
     assert result == {"results": []}

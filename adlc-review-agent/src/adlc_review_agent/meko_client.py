@@ -144,23 +144,36 @@ class MekoMcpClient:
         self,
         *,
         query: str,
+        conversation_id: str,
         datapack_id: str,
         agent_id: str = "adlc-review-agent",
         limit: int = 10,
     ) -> Any:
         return self.call_tool(
             "context_search",
-            {"query": query, "datapack_id": datapack_id, "agent_id": agent_id, "limit": limit},
+            {
+                "query": query,
+                "conversation_id": conversation_id,
+                "datapack_id": datapack_id,
+                "agent_id": agent_id,
+                "limit": limit,
+            },
         )
 
     def knowledgebase_search(
         self,
         *,
         query: str,
+        conversation_id: str,
         datapack_id: str,
         agent_id: str = "adlc-review-agent",
     ) -> Any:
         return self.call_tool(
             "knowledgebase_search",
-            {"query": query, "datapack_id": datapack_id, "agent_id": agent_id},
+            {
+                "query": query,
+                "conversation_id": conversation_id,
+                "datapack_id": datapack_id,
+                "agent_id": agent_id,
+            },
         )

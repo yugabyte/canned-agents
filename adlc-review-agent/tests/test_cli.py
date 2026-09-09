@@ -24,7 +24,9 @@ def test_full_run_without_slack(
 ) -> None:
     mock_fetch_pr.return_value = PullRequest(title="Add endpoint", html_url="https://x", diff="+ x = 1")
     mock_meko_cls.return_value.__enter__.return_value = MagicMock()
-    mock_run_review.return_value = ReviewResult(text="Looks fine.", kb_context="(none found)")
+    mock_run_review.return_value = ReviewResult(
+        text="Looks fine.", kb_context="(none found)", input_tokens=100, output_tokens=50, context_stats={}
+    )
 
     result = _invoke(
         [
@@ -51,7 +53,9 @@ def test_posts_to_slack_when_requested(
 ) -> None:
     mock_fetch_pr.return_value = PullRequest(title="Add endpoint", html_url="https://x", diff="+ x = 1")
     mock_meko_cls.return_value.__enter__.return_value = MagicMock()
-    mock_run_review.return_value = ReviewResult(text="Looks fine.", kb_context="(none found)")
+    mock_run_review.return_value = ReviewResult(
+        text="Looks fine.", kb_context="(none found)", input_tokens=100, output_tokens=50, context_stats={}
+    )
 
     result = _invoke(
         [

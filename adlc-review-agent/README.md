@@ -127,7 +127,7 @@ aws bedrock-agentcore-control create-agent-runtime \
   --agent-runtime-artifact '{"containerConfiguration":{"containerUri":"{MEKO_LABS_AGENT_IMAGES_REPO}/adlc-review-agent:latest"}}' \
   --role-arn <meko's managed AgentCore execution role arn> \
   --network-configuration networkMode=PUBLIC \
-  --environment-variables MEKO_PAT=<a PAT for the account the datapack gets shared with> \
+  --environment-variables MEKO_PAT=<a PAT for the account the datapack gets shared with>,MEKO_MCP_URL=<this environment's Meko MCP endpoint, e.g. https://mcp.mekodev.com/mcp for dev> \
   --region us-east-1
 ```
 
@@ -135,9 +135,13 @@ Poll `get-agent-runtime` until `status: READY`, then register the resulting
 `agentRuntimeArn` in `meko_system.shared_deployments` (keyed by `agent_slug`)
 so `GET/POST /deployments/shared/:agent_slug*` can find it — see
 `api_server`'s own docs for that table. `MEKO_PAT` is read by
-`agentcore_entrypoint.py`'s `_resolve_meko_pat` only when the invoking
-payload has no `meko_pat` of its own, which is exactly what
-`invokeSharedDeployment` (meko_ui) sends.
+`agentcore_entrypoint.py`'s `_resolve_meko_pat`, and `MEKO_MCP_URL` by its
+`_resolve_meko_mcp_url`, only when the invoking payload has no `meko_pat`/
+`meko_mcp_url` of its own -- which is exactly what `invokeSharedDeployment`
+(meko_ui) sends. **`MEKO_MCP_URL` must match the deployment's own
+environment** (dev vs prod) -- omitting it silently falls back to
+production, so a dev-deployed shared instance would talk to prod's Meko
+and fail to find any dev-only datapack.
 
 ## Development
 
