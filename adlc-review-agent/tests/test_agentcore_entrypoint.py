@@ -65,11 +65,45 @@ def test_handler_success_without_slack(
     assert events[-1] == {
         "type": "done",
         "review": "Looks fine.",
+        "findings": [],
+        "usage": None,
+        "context_stats": None,
         "slack_posted": False,
         "slack_error": None,
     }
     mock_anthropic_bedrock.assert_called_once_with()
     mock_post.assert_not_called()
+
+
+@_patched
+def test_handler_forwards_findings_usage_and_context_stats_to_the_outer_done_event(
+    mock_anthropic_bedrock, mock_fetch_pr, mock_meko_cls, mock_create_conversation, mock_run_review_stream, mock_post
+) -> None:
+    # Regression test: _stream_review used to rebuild its own "done" event
+    # from scratch (type/review/slack_posted/slack_error only), silently
+    # dropping findings/usage/context_stats from run_review_stream's own
+    # "done" event instead of forwarding them.
+    mock_fetch_pr.return_value = PullRequest(title="Add endpoint", html_url="https://x", diff="+ x = 1")
+    mock_meko_cls.return_value.__enter__.return_value = MagicMock()
+    mock_create_conversation.return_value = "conv-1"
+    mock_run_review_stream.return_value = iter(
+        [
+            {
+                "type": "done",
+                "text": "Looks fine.",
+                "findings": [{"severity": "minor", "location": "", "comment": "Nit."}],
+                "kb_context": "(none found)",
+                "usage": {"input_tokens": 100, "output_tokens": 50},
+                "context_stats": {"kb_chunks_retrieved": 3, "kb_chunks_total": 10},
+            }
+        ]
+    )
+
+    events = _events(dict(_BASE_PAYLOAD))
+
+    assert events[-1]["findings"] == [{"severity": "minor", "location": "", "comment": "Nit."}]
+    assert events[-1]["usage"] == {"input_tokens": 100, "output_tokens": 50}
+    assert events[-1]["context_stats"] == {"kb_chunks_retrieved": 3, "kb_chunks_total": 10}
 
 
 @_patched
@@ -102,6 +136,9 @@ def test_handler_partial_success_when_slack_post_fails(
     assert events[-1] == {
         "type": "done",
         "review": "Looks fine.",
+        "findings": [],
+        "usage": None,
+        "context_stats": None,
         "slack_posted": False,
         "slack_error": "channel_not_found",
     }
@@ -331,7 +368,7 @@ def test_handler_followup_mode_reuses_conversation_id(mock_anthropic_bedrock, mo
     )
 
     assert events[0] == {"type": "meta", "conversation_id": "conv-existing"}
-    assert events[-1] == {"type": "done", "review": "It's a false positive."}
+    assert events[-1] == {"type": "done", "review": "It's a false positive.", "usage": None}
     mock_run_followup.assert_called_once()
     assert mock_run_followup.call_args.kwargs["conversation_id"] == "conv-existing"
     assert mock_run_followup.call_args.kwargs["question"] == "Why is that a problem?"
