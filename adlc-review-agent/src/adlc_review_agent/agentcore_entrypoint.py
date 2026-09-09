@@ -200,6 +200,9 @@ def _stream_review(
         }
 
         full_text = ""
+        findings: list[dict[str, Any]] = []
+        usage: dict[str, Any] | None = None
+        context_stats: dict[str, Any] | None = None
         for event in run_review_stream(
             meko=meko,
             anthropic_client=AnthropicBedrock(),
@@ -214,6 +217,9 @@ def _stream_review(
                 yield event
             elif event["type"] == "done":
                 full_text = event["text"]
+                findings = event.get("findings", [])
+                usage = event.get("usage")
+                context_stats = event.get("context_stats")
 
         slack_posted = False
         slack_error = None
@@ -231,6 +237,9 @@ def _stream_review(
         yield {
             "type": "done",
             "review": full_text,
+            "findings": findings,
+            "usage": usage,
+            "context_stats": context_stats,
             "slack_posted": slack_posted,
             "slack_error": slack_error,
         }
@@ -251,6 +260,7 @@ def _stream_followup(
         yield {"type": "meta", "conversation_id": conversation_id}
 
         full_text = ""
+        usage: dict[str, Any] | None = None
         for event in run_followup_stream(
             meko=meko,
             anthropic_client=AnthropicBedrock(),
@@ -265,8 +275,9 @@ def _stream_followup(
                 yield event
             elif event["type"] == "done":
                 full_text = event["text"]
+                usage = event.get("usage")
 
-        yield {"type": "done", "review": full_text}
+        yield {"type": "done", "review": full_text, "usage": usage}
 
 
 if __name__ == "__main__":

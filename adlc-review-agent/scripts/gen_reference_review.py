@@ -95,6 +95,7 @@ def main() -> None:
         json.dumps(
             {
                 "text": result.text,
+                "findings": result.findings,
                 "input_tokens": result.input_tokens,
                 "output_tokens": result.output_tokens,
                 "model": MODEL,

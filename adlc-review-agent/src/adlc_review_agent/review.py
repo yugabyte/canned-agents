@@ -15,6 +15,7 @@ needs the delimiting/framing defenses tone/strictness don't).
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 from typing import Any, Iterator, Literal, Optional
 
@@ -116,7 +117,16 @@ Memories (from `memory_search`):
 {tone_strictness_block}{focus_block}
 
 If the knowledge base is empty, say so explicitly and review the diff
-against general best practice instead of inventing standards."""
+against general best practice instead of inventing standards.
+
+Respond with ONLY a single JSON object -- no markdown code fence, no prose
+before or after it -- matching exactly this shape:
+{{"findings": [{{"severity": "critical", "location": "path/to/file.py:42", "comment": "What's wrong and why, in one or two sentences."}}]}}
+
+`severity` is one of "critical", "major", or "minor". `location` is a
+file:line reference when one applies, else a short description of where the
+issue is. List findings most severe first. If there is nothing to flag,
+respond with {{"findings": []}}."""
 
 FOLLOWUP_SYSTEM_PROMPT = """You are continuing a code review conversation on Meko.
 Here is the original review you gave:
@@ -235,9 +245,69 @@ def _format_memory_hits(mem_result: Any) -> str:
     return "\n".join(lines) if lines else "(none found)"
 
 
+_VALID_SEVERITIES = ("critical", "major", "minor")
+
+
+def _render_findings_markdown(findings: list[dict[str, str]]) -> str:
+    """Renders structured findings back into markdown text -- kept around so
+    _add_message/Slack-posting/the CLI's own printed output all still get
+    readable text, without needing to know about the structured shape."""
+    if not findings:
+        return "No issues found."
+    lines = []
+    for finding in findings:
+        location = finding["location"]
+        location_part = f" `{location}`" if location else ""
+        lines.append(f"**{finding['severity'].upper()}**{location_part} — {finding['comment']}")
+    return "\n\n".join(lines)
+
+
+def _parse_findings(raw_text: str) -> tuple[list[dict[str, str]], str]:
+    """Parses the model's structured-findings JSON response (see
+    REVIEW_SYSTEM_PROMPT's response-format instructions). Returns
+    `(findings, markdown_text)`. On any parse failure -- the model added
+    prose around the JSON despite instructions, wrapped it in a code fence,
+    or returned something that isn't valid JSON at all -- returns
+    `([], raw_text)` rather than raising, so a malformed response degrades to
+    "no structured findings, here's what it said" instead of failing the
+    whole review."""
+    text = raw_text.strip()
+    if text.startswith("```"):
+        text = text.strip("`")
+        if text.startswith("json"):
+            text = text[len("json") :]
+        text = text.strip()
+
+    try:
+        parsed = json.loads(text)
+        raw_findings = parsed["findings"]
+        if not isinstance(raw_findings, list):
+            raise TypeError("findings is not a list")
+    except Exception:
+        return [], raw_text
+
+    findings: list[dict[str, str]] = []
+    for item in raw_findings:
+        if not isinstance(item, dict):
+            continue
+        comment = str(item.get("comment", "")).strip()
+        if not comment:
+            continue
+        severity = str(item.get("severity", "minor")).strip().lower()
+        findings.append(
+            {
+                "severity": severity if severity in _VALID_SEVERITIES else "minor",
+                "location": str(item.get("location", "")).strip(),
+                "comment": comment,
+            }
+        )
+    return findings, _render_findings_markdown(findings)
+
+
 @dataclass
 class ReviewResult:
     text: str
+    findings: list[dict[str, str]]
     kb_context: str
     input_tokens: int
     output_tokens: int
@@ -347,9 +417,13 @@ def run_review_stream(
     config: ReviewConfig = ReviewConfig(),
     model: str = DEFAULT_MODEL,
 ) -> Iterator[dict[str, Any]]:
-    """Streams a review as a sequence of events: `{"type": "text_delta",
-    "text": ...}` per chunk, then a final `{"type": "done", "text":
-    full_text, "kb_context": ...}`. Writes the turn to `conversation_id` via
+    """Streams a review, yielding a single final `{"type": "done", "text":
+    ..., "findings": [...], "kb_context": ...}` -- the model's response is
+    structured findings JSON (see REVIEW_SYSTEM_PROMPT), not reviewer-facing
+    prose, so intermediate `text_delta` chunks are consumed internally, not
+    forwarded: streaming raw JSON character-by-character would show the user
+    a malformed-looking response mid-stream. Callers see nothing until the
+    full response is parsed. Writes the turn to `conversation_id` via
     conversation_add_message once the full text is known."""
     kb_context = "(knowledge base search disabled for this review)"
     kb_chunks_retrieved = 0
@@ -387,18 +461,17 @@ def run_review_stream(
     )
     user_content = f"Title: {pr_title}\n\n```diff\n{pr_diff}\n```"
 
-    full_text_parts: list[str] = []
+    raw_text_parts: list[str] = []
     usage = {"input_tokens": 0, "output_tokens": 0}
     for event in _stream_llm_response(
         anthropic_client=anthropic_client, model=model, system=system, user_content=user_content
     ):
         if event["type"] == "text_delta":
-            full_text_parts.append(event["text"])
-            yield event
+            raw_text_parts.append(event["text"])
         else:
             usage = {"input_tokens": event["input_tokens"], "output_tokens": event["output_tokens"]}
 
-    full_text = "".join(full_text_parts)
+    findings, full_text = _parse_findings("".join(raw_text_parts))
     _add_message(meko, conversation_id=conversation_id, datapack_id=datapack_id, input_text=user_content, output_text=full_text)
     context_stats = _build_context_stats(
         meko=meko,
@@ -414,6 +487,7 @@ def run_review_stream(
     yield {
         "type": "done",
         "text": full_text,
+        "findings": findings,
         "kb_context": kb_context,
         "usage": usage,
         "context_stats": context_stats,
@@ -476,6 +550,7 @@ def run_review(
     up front, for later follow-up turns)."""
     conversation_id = _create_conversation(meko, datapack_id, title=f"Review: {pr_title}")
     full_text = ""
+    findings: list[dict[str, str]] = []
     kb_context = ""
     usage = {"input_tokens": 0, "output_tokens": 0}
     context_stats: dict[str, Any] = {}
@@ -491,11 +566,13 @@ def run_review(
     ):
         if event["type"] == "done":
             full_text = event["text"]
+            findings = event["findings"]
             kb_context = event["kb_context"]
             usage = event["usage"]
             context_stats = event["context_stats"]
     return ReviewResult(
         text=full_text,
+        findings=findings,
         kb_context=kb_context,
         input_tokens=usage["input_tokens"],
         output_tokens=usage["output_tokens"],

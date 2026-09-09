@@ -162,9 +162,14 @@ def test_run_review_handles_empty_knowledge_base() -> None:
     assert "(none found)" in result.kb_context
 
 
-def test_run_review_stream_yields_text_deltas_then_done() -> None:
+def test_run_review_stream_yields_a_single_done_event_with_parsed_findings() -> None:
+    # The model's raw response is structured-findings JSON, not
+    # reviewer-facing prose (see REVIEW_SYSTEM_PROMPT) -- it's never
+    # forwarded as text_delta chunks (that would show the user malformed
+    # JSON mid-stream), so the only event is the final "done".
+    raw_json = '{"findings": [{"severity": "critical", "location": "api/spend.py:16", "comment": "SQL injection."}]}'
     meko = _FakeMeko({"results": []})
-    anthropic_client = _fake_anthropic("Hello world")
+    anthropic_client = _fake_anthropic(raw_json)
 
     events = list(
         run_review_stream(
@@ -177,11 +182,56 @@ def test_run_review_stream_yields_text_deltas_then_done() -> None:
         )
     )
 
-    deltas, done = _drain(events)
-    assert "".join(deltas) == "Hello world"
-    assert done["text"] == "Hello world"
+    assert len(events) == 1
+    done = events[0]
+    assert done["type"] == "done"
+    assert done["findings"] == [{"severity": "critical", "location": "api/spend.py:16", "comment": "SQL injection."}]
+    assert "SQL injection." in done["text"]
     assert done["usage"] == {"input_tokens": 100, "output_tokens": 50}
-    assert events[-1] is done
+
+
+def test_run_review_stream_degrades_to_raw_text_on_unparseable_response() -> None:
+    # A model that ignores the JSON-only instruction must not fail the whole
+    # review -- findings comes back empty and `text` falls back to whatever
+    # the model actually said.
+    meko = _FakeMeko({"results": []})
+    anthropic_client = _fake_anthropic("Sure, here's my review: looks fine to me!")
+
+    events = list(
+        run_review_stream(
+            meko=meko,  # type: ignore[arg-type]
+            anthropic_client=anthropic_client,
+            datapack_id="dp-1",
+            pr_title="Add endpoint",
+            pr_diff="+ x = 1",
+            conversation_id="conv-1",
+        )
+    )
+
+    done = events[0]
+    assert done["findings"] == []
+    assert done["text"] == "Sure, here's my review: looks fine to me!"
+
+
+def test_parse_findings_strips_a_markdown_code_fence() -> None:
+    # Despite the "no code fence" instruction, models commonly wrap JSON in
+    # a ```json fence anyway -- this must still parse.
+    fenced = '```json\n{"findings": [{"severity": "minor", "location": "", "comment": "Nit."}]}\n```'
+    meko = _FakeMeko({"results": []})
+    anthropic_client = _fake_anthropic(fenced)
+
+    events = list(
+        run_review_stream(
+            meko=meko,  # type: ignore[arg-type]
+            anthropic_client=anthropic_client,
+            datapack_id="dp-1",
+            pr_title="Add endpoint",
+            pr_diff="+ x = 1",
+            conversation_id="conv-1",
+        )
+    )
+
+    assert events[0]["findings"] == [{"severity": "minor", "location": "", "comment": "Nit."}]
 
 
 def test_run_review_respects_enable_knowledge_base_false() -> None:
@@ -388,7 +438,9 @@ def test_run_review_stream_routes_a_non_anthropic_model_through_converse() -> No
     anthropic_client = _fake_anthropic("should never be used")
     fake_bedrock = MagicMock()
     fake_bedrock.converse_stream.return_value = _fake_converse_stream(
-        "Looks fine for a small model.", input_tokens=812, output_tokens=214
+        '{"findings": [{"severity": "minor", "location": "", "comment": "Looks fine for a small model."}]}',
+        input_tokens=812,
+        output_tokens=214,
     )
 
     with patch("adlc_review_agent.review._get_bedrock_runtime", return_value=fake_bedrock):
@@ -404,8 +456,8 @@ def test_run_review_stream_routes_a_non_anthropic_model_through_converse() -> No
             )
         )
 
-    deltas, done = _drain(events)
-    assert "".join(deltas) == "Looks fine for a small model."
+    done = events[0]
+    assert done["findings"] == [{"severity": "minor", "location": "", "comment": "Looks fine for a small model."}]
     assert done["usage"] == {"input_tokens": 812, "output_tokens": 214}
     anthropic_client.messages.stream.assert_not_called()
 
