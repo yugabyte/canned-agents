@@ -352,7 +352,12 @@ def _add_message(meko: MekoMcpClient, *, conversation_id: str, datapack_id: str,
             "agent_id": AGENT_ID,
             "input": input_text,
             "output": output_text,
-            "index_for_search": False,
+            # A review turn carries the whole diff, so it would land in the
+            # shared conversation-search index as a large near-duplicate of
+            # the PR it already reviewed. Was `index_for_search: False`,
+            # which meko-mcp-server removed in MEKO-466 (#272) -- the tool
+            # now REJECTS the old name rather than ignoring it.
+            "skip_search_embed": True,
             "datapack_id": datapack_id,
         },
     )

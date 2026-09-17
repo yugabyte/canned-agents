@@ -400,6 +400,11 @@ def test_followup_reuses_conversation_id_and_streams() -> None:
     add_message_args = meko.tool_calls[0][1]
     assert add_message_args["conversation_id"] == "conv-existing"
     assert add_message_args["input"] == "Why is that a problem?"
+    # The MCP server rejects an unrecognized keyword outright, so the name
+    # here is load-bearing: `index_for_search` failed every review once
+    # meko-mcp-server removed it.
+    assert add_message_args["skip_search_embed"] is True
+    assert "index_for_search" not in add_message_args
 
     call_kwargs = anthropic_client.messages.stream.call_args.kwargs
     assert "Flagged a bare except on line 20." in call_kwargs["system"]
