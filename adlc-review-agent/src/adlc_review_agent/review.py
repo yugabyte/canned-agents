@@ -262,12 +262,62 @@ def _render_findings_markdown(findings: list[dict[str, str]]) -> str:
     return "\n\n".join(lines)
 
 
+# A `"` genuinely ends a string only when the next thing that matters is
+# structural. Anything else means the model wrote a quote it should have
+# escaped.
+_STRUCTURAL_AFTER_STRING = {",", ":", "}", "]"}
+
+
+def _escape_stray_quotes(text: str) -> str:
+    """Re-escapes `"` characters the model left raw inside string values.
+
+    These reviews quote the code they flag, and the code contains quotes:
+
+        "location": "... WHERE team_id = " + team_id + " GROUP BY user_id"
+
+    which ends the JSON string at `team_id = ` and makes the rest syntax
+    garbage. The model escapes correctly on some findings and not others in
+    the same response, so this is not something the prompt can be trusted to
+    prevent -- one bad `location` discarded a whole review.
+
+    A closing quote is one followed (after whitespace) by `,` `:` `}` `]` or
+    end of input. Every other `"` inside a string is content and gets
+    escaped. Structure is untouched, so a response that was already valid
+    passes through unchanged."""
+    out: list[str] = []
+    in_string = False
+    escaped = False
+    for i, ch in enumerate(text):
+        if not in_string:
+            out.append(ch)
+            if ch == '"':
+                in_string = True
+            continue
+        if escaped:
+            out.append(ch)
+            escaped = False
+            continue
+        if ch == "\\":
+            out.append(ch)
+            escaped = True
+            continue
+        if ch == '"':
+            rest = text[i + 1 :].lstrip()
+            if not rest or rest[0] in _STRUCTURAL_AFTER_STRING:
+                out.append(ch)
+                in_string = False
+            else:
+                out.append('\\"')
+            continue
+        out.append(ch)
+    return "".join(out)
+
+
 def _extract_json_object(text: str) -> str | None:
-    """The first balanced `{...}` span in `text`, or None. The SLMs routinely
+    """The first balanced `{...}` span in `text`, or None. The SLMs also
     ignore "no prose before or after it" and answer with a sentence, the
-    object, and a sign-off; scanning the braces recovers the review that is
-    sitting right there instead of discarding it. String-aware, so a brace
-    inside a comment does not end the span early."""
+    object, and a sign-off; scanning the braces recovers those. String-aware,
+    so a brace inside a comment does not end the span early."""
     start = text.find("{")
     while start != -1:
         depth = 0
@@ -316,7 +366,7 @@ def _parse_findings(raw_text: str) -> tuple[list[dict[str, str]] | None, str]:
         text = text.strip()
 
     raw_findings = None
-    for candidate in (text, _extract_json_object(text)):
+    for candidate in (text, _escape_stray_quotes(text), _extract_json_object(text)):
         if not candidate:
             continue
         try:

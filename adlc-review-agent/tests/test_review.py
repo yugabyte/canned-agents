@@ -221,6 +221,39 @@ def test_run_review_stream_reports_an_empty_finding_list_as_empty_not_unparsed()
     assert done["findings"] == []
 
 
+def test_parse_findings_recovers_unescaped_quotes_inside_a_value() -> None:
+    # Captured from a real Ministral 14B run (datapack adlc-code-review-Oct7,
+    # 2026-10-07): six findings, the SQL injection among them, thrown away
+    # because ONE location pasted the offending query and left its quotes
+    # raw. The model escaped them correctly in the finding above it, so the
+    # prompt cannot be trusted to prevent this.
+    done = _done_for(
+        '```json\n'
+        '{"findings": [\n'
+        '  {"severity": "critical", "location": "request.args.get(\\"team_id\\")", '
+        '"comment": "No authorization check."},\n'
+        '  {"severity": "critical", '
+        '"location": "SELECT user_id FROM spend WHERE team_id = " + team_id + " GROUP BY user_id", '
+        '"comment": "Interpolates team_id into SQL without parameterization."}\n'
+        ']}\n'
+        '```'
+    )
+
+    assert done["findings"] is not None
+    assert len(done["findings"]) == 2
+    assert done["findings"][1]["location"] == (
+        'SELECT user_id FROM spend WHERE team_id = " + team_id + " GROUP BY user_id'
+    )
+
+
+def test_parse_findings_leaves_a_well_formed_response_untouched() -> None:
+    # The repair must never run on valid JSON: strict parsing is tried first,
+    # so an escaped quote stays one character, not two.
+    done = _done_for('{"findings": [{"severity": "minor", "location": "", "comment": "Use \\"x\\" here."}]}')
+
+    assert done["findings"] == [{"severity": "minor", "location": "", "comment": 'Use "x" here.'}]
+
+
 def test_parse_findings_recovers_json_wrapped_in_prose() -> None:
     # What the 14B models actually return: the object, with a sentence either
     # side of it. The findings are right there and must not be discarded.
