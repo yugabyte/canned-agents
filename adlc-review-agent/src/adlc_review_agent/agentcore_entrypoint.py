@@ -200,7 +200,10 @@ def _stream_review(
         }
 
         full_text = ""
-        findings: list[dict[str, Any]] = []
+        # None until a done event arrives, and still None afterwards when the
+        # model's response could not be parsed -- which is why the key is
+        # omitted below rather than sent as [].
+        findings: list[dict[str, Any]] | None = None
         usage: dict[str, Any] | None = None
         context_stats: dict[str, Any] | None = None
         for event in run_review_stream(
@@ -217,7 +220,7 @@ def _stream_review(
                 yield event
             elif event["type"] == "done":
                 full_text = event["text"]
-                findings = event.get("findings", [])
+                findings = event.get("findings")
                 usage = event.get("usage")
                 context_stats = event.get("context_stats")
 
@@ -234,15 +237,20 @@ def _stream_review(
             except SlackApiError as exc:
                 slack_error = str(exc)
 
-        yield {
+        done: dict[str, Any] = {
             "type": "done",
             "review": full_text,
-            "findings": findings,
             "usage": usage,
             "context_stats": context_stats,
             "slack_posted": slack_posted,
             "slack_error": slack_error,
         }
+        # ABSENT findings means "unparsed", which the client already reads as
+        # "show the prose in `review` instead". Sending [] would claim the
+        # model found nothing, and `review` holds the words proving otherwise.
+        if findings is not None:
+            done["findings"] = findings
+        yield done
 
 
 def _stream_followup(

@@ -190,27 +190,67 @@ def test_run_review_stream_yields_a_single_done_event_with_parsed_findings() -> 
     assert done["usage"] == {"input_tokens": 100, "output_tokens": 50}
 
 
-def test_run_review_stream_degrades_to_raw_text_on_unparseable_response() -> None:
-    # A model that ignores the JSON-only instruction must not fail the whole
-    # review -- findings comes back empty and `text` falls back to whatever
-    # the model actually said.
-    meko = _FakeMeko({"results": []})
-    anthropic_client = _fake_anthropic("Sure, here's my review: looks fine to me!")
-
-    events = list(
+def _done_for(response: str) -> dict:
+    return list(
         run_review_stream(
-            meko=meko,  # type: ignore[arg-type]
-            anthropic_client=anthropic_client,
+            meko=_FakeMeko({"results": []}),  # type: ignore[arg-type]
+            anthropic_client=_fake_anthropic(response),
             datapack_id="dp-1",
             pr_title="Add endpoint",
             pr_diff="+ x = 1",
             conversation_id="conv-1",
         )
+    )[0]
+
+
+def test_run_review_stream_degrades_to_raw_text_on_unparseable_response() -> None:
+    # A model that ignores the JSON-only instruction must not fail the whole
+    # review. findings is None, NOT [] -- [] is a clean diff, and reporting
+    # one here is how a SQL injection got waved through as "no issues".
+    done = _done_for("Sure, here's my review: looks fine to me!")
+
+    assert done["findings"] is None
+    assert done["text"] == "Sure, here's my review: looks fine to me!"
+
+
+def test_run_review_stream_reports_an_empty_finding_list_as_empty_not_unparsed() -> None:
+    # The other side of the same distinction: the model did answer in the
+    # required shape and found nothing.
+    done = _done_for('{"findings": []}')
+
+    assert done["findings"] == []
+
+
+def test_parse_findings_recovers_json_wrapped_in_prose() -> None:
+    # What the 14B models actually return: the object, with a sentence either
+    # side of it. The findings are right there and must not be discarded.
+    done = _done_for(
+        'Here is my review of the diff:\n'
+        '{"findings": [{"severity": "critical", "location": "api/spend.py:15", '
+        '"comment": "team_id is concatenated into the SQL string."}]}\n'
+        "Let me know if you would like me to expand on any of these."
     )
 
-    done = events[0]
-    assert done["findings"] == []
-    assert done["text"] == "Sure, here's my review: looks fine to me!"
+    assert done["findings"] == [
+        {
+            "severity": "critical",
+            "location": "api/spend.py:15",
+            "comment": "team_id is concatenated into the SQL string.",
+        }
+    ]
+
+
+def test_parse_findings_does_not_end_the_object_at_a_brace_inside_a_string() -> None:
+    # The brace scan is string-aware, so a comment quoting code with braces
+    # does not truncate the span.
+    done = _done_for(
+        'Review:\n{"findings": [{"severity": "minor", "location": "", '
+        '"comment": "Prefer f\'{x}\' over concatenation."}]}'
+    )
+
+    assert done["findings"] == [
+        {"severity": "minor", "location": "", "comment": "Prefer f'{x}' over concatenation."}
+    ]
 
 
 def test_parse_findings_strips_a_markdown_code_fence() -> None:

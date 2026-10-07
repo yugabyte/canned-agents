@@ -48,7 +48,7 @@ def test_handler_success_without_slack(
         [
             {"type": "text_delta", "text": "Looks "},
             {"type": "text_delta", "text": "fine."},
-            {"type": "done", "text": "Looks fine.", "kb_context": "(none found)"},
+            {"type": "done", "text": "Looks fine.", "findings": [], "kb_context": "(none found)"},
         ]
     )
 
@@ -107,13 +107,41 @@ def test_handler_forwards_findings_usage_and_context_stats_to_the_outer_done_eve
 
 
 @_patched
+def test_handler_omits_findings_entirely_when_the_response_was_unparsed(
+    mock_anthropic_bedrock, mock_fetch_pr, mock_meko_cls, mock_create_conversation, mock_run_review_stream, mock_post
+) -> None:
+    # The wire contract the client reads: an ABSENT findings key means "could
+    # not parse, show the prose in `review`". Sending [] instead claims the
+    # model found nothing, which is how a diff with a SQL injection in it was
+    # reported as clean.
+    mock_fetch_pr.return_value = PullRequest(title="Add endpoint", html_url="https://x", diff="+ x = 1")
+    mock_meko_cls.return_value.__enter__.return_value = MagicMock()
+    mock_create_conversation.return_value = "conv-1"
+    mock_run_review_stream.return_value = iter(
+        [
+            {
+                "type": "done",
+                "text": "The team_id parameter is concatenated into the SQL string.",
+                "findings": None,
+                "kb_context": "(none found)",
+            }
+        ]
+    )
+
+    events = _events(dict(_BASE_PAYLOAD))
+
+    assert "findings" not in events[-1]
+    assert events[-1]["review"] == "The team_id parameter is concatenated into the SQL string."
+
+
+@_patched
 def test_handler_posts_to_slack_when_requested(
     mock_anthropic_bedrock, mock_fetch_pr, mock_meko_cls, mock_create_conversation, mock_run_review_stream, mock_post
 ) -> None:
     mock_fetch_pr.return_value = PullRequest(title="Add endpoint", html_url="https://x", diff="+ x = 1")
     mock_meko_cls.return_value.__enter__.return_value = MagicMock()
     mock_create_conversation.return_value = "conv-1"
-    mock_run_review_stream.return_value = iter([{"type": "done", "text": "Looks fine.", "kb_context": "(none found)"}])
+    mock_run_review_stream.return_value = iter([{"type": "done", "text": "Looks fine.", "findings": [], "kb_context": "(none found)"}])
 
     events = _events({**_BASE_PAYLOAD, "slack_token": "xoxb-fake", "slack_channel": "#pr-reviews"})
 
@@ -128,7 +156,7 @@ def test_handler_partial_success_when_slack_post_fails(
     mock_fetch_pr.return_value = PullRequest(title="Add endpoint", html_url="https://x", diff="+ x = 1")
     mock_meko_cls.return_value.__enter__.return_value = MagicMock()
     mock_create_conversation.return_value = "conv-1"
-    mock_run_review_stream.return_value = iter([{"type": "done", "text": "Looks fine.", "kb_context": "(none found)"}])
+    mock_run_review_stream.return_value = iter([{"type": "done", "text": "Looks fine.", "findings": [], "kb_context": "(none found)"}])
     mock_post.side_effect = SlackApiError("channel_not_found")
 
     events = _events({**_BASE_PAYLOAD, "slack_token": "xoxb-fake", "slack_channel": "#missing"})
@@ -175,7 +203,7 @@ def test_handler_falls_back_to_meko_pat_env_var(
     mock_fetch_pr.return_value = PullRequest(title="Add endpoint", html_url="https://x", diff="+ x = 1")
     mock_meko_cls.return_value.__enter__.return_value = MagicMock()
     mock_create_conversation.return_value = "conv-1"
-    mock_run_review_stream.return_value = iter([{"type": "done", "text": "Looks fine.", "kb_context": "(none found)"}])
+    mock_run_review_stream.return_value = iter([{"type": "done", "text": "Looks fine.", "findings": [], "kb_context": "(none found)"}])
 
     payload = dict(_BASE_PAYLOAD)
     del payload["meko_pat"]
@@ -198,7 +226,7 @@ def test_handler_falls_back_to_meko_mcp_url_env_var(
     mock_fetch_pr.return_value = PullRequest(title="Add endpoint", html_url="https://x", diff="+ x = 1")
     mock_meko_cls.return_value.__enter__.return_value = MagicMock()
     mock_create_conversation.return_value = "conv-1"
-    mock_run_review_stream.return_value = iter([{"type": "done", "text": "Looks fine.", "kb_context": "(none found)"}])
+    mock_run_review_stream.return_value = iter([{"type": "done", "text": "Looks fine.", "findings": [], "kb_context": "(none found)"}])
 
     payload = dict(_BASE_PAYLOAD)
     events = _events(payload)
@@ -216,7 +244,7 @@ def test_handler_payload_meko_mcp_url_wins_over_env_var(
     mock_fetch_pr.return_value = PullRequest(title="Add endpoint", html_url="https://x", diff="+ x = 1")
     mock_meko_cls.return_value.__enter__.return_value = MagicMock()
     mock_create_conversation.return_value = "conv-1"
-    mock_run_review_stream.return_value = iter([{"type": "done", "text": "Looks fine.", "kb_context": "(none found)"}])
+    mock_run_review_stream.return_value = iter([{"type": "done", "text": "Looks fine.", "findings": [], "kb_context": "(none found)"}])
 
     payload = {**_BASE_PAYLOAD, "meko_mcp_url": "https://mcp.example-override.ai/mcp"}
     events = _events(payload)
@@ -236,7 +264,7 @@ def test_handler_defaults_to_bedrock_shaped_model(
     mock_fetch_pr.return_value = PullRequest(title="Add endpoint", html_url="https://x", diff="+ x = 1")
     mock_meko_cls.return_value.__enter__.return_value = MagicMock()
     mock_create_conversation.return_value = "conv-1"
-    mock_run_review_stream.return_value = iter([{"type": "done", "text": "Looks fine.", "kb_context": "(none found)"}])
+    mock_run_review_stream.return_value = iter([{"type": "done", "text": "Looks fine.", "findings": [], "kb_context": "(none found)"}])
 
     events = _events(dict(_BASE_PAYLOAD))
 
@@ -251,7 +279,7 @@ def test_handler_payload_model_overrides_bedrock_default(
     mock_fetch_pr.return_value = PullRequest(title="Add endpoint", html_url="https://x", diff="+ x = 1")
     mock_meko_cls.return_value.__enter__.return_value = MagicMock()
     mock_create_conversation.return_value = "conv-1"
-    mock_run_review_stream.return_value = iter([{"type": "done", "text": "Looks fine.", "kb_context": "(none found)"}])
+    mock_run_review_stream.return_value = iter([{"type": "done", "text": "Looks fine.", "findings": [], "kb_context": "(none found)"}])
 
     payload = {**_BASE_PAYLOAD, "model": "anthropic.claude-opus-4-1-20250805-v1:0"}
     events = _events(payload)

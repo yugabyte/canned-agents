@@ -262,15 +262,52 @@ def _render_findings_markdown(findings: list[dict[str, str]]) -> str:
     return "\n\n".join(lines)
 
 
-def _parse_findings(raw_text: str) -> tuple[list[dict[str, str]], str]:
+def _extract_json_object(text: str) -> str | None:
+    """The first balanced `{...}` span in `text`, or None. The SLMs routinely
+    ignore "no prose before or after it" and answer with a sentence, the
+    object, and a sign-off; scanning the braces recovers the review that is
+    sitting right there instead of discarding it. String-aware, so a brace
+    inside a comment does not end the span early."""
+    start = text.find("{")
+    while start != -1:
+        depth = 0
+        in_string = False
+        escaped = False
+        for i in range(start, len(text)):
+            ch = text[i]
+            if in_string:
+                if escaped:
+                    escaped = False
+                elif ch == "\\":
+                    escaped = True
+                elif ch == '"':
+                    in_string = False
+            elif ch == '"':
+                in_string = True
+            elif ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    return text[start : i + 1]
+        start = text.find("{", start + 1)
+    return None
+
+
+def _parse_findings(raw_text: str) -> tuple[list[dict[str, str]] | None, str]:
     """Parses the model's structured-findings JSON response (see
     REVIEW_SYSTEM_PROMPT's response-format instructions). Returns
-    `(findings, markdown_text)`. On any parse failure -- the model added
-    prose around the JSON despite instructions, wrapped it in a code fence,
-    or returned something that isn't valid JSON at all -- returns
-    `([], raw_text)` rather than raising, so a malformed response degrades to
-    "no structured findings, here's what it said" instead of failing the
-    whole review."""
+    `(findings, markdown_text)`.
+
+    `findings` is **None** when nothing could be parsed, which is NOT the
+    same as `[]`. `[]` is the model saying the diff is clean; None is the
+    model saying something we could not read. Collapsing both to `[]` made a
+    14B model's prose answer indistinguishable from a clean bill of health,
+    and the lab reported "no blocking issues" on a diff with a SQL injection
+    in it. Callers that put this on the wire must keep the two apart.
+
+    The text is never lost either way: on failure the raw response comes back
+    as the markdown half, so a caller can still show what the model said."""
     text = raw_text.strip()
     if text.startswith("```"):
         text = text.strip("`")
@@ -278,13 +315,24 @@ def _parse_findings(raw_text: str) -> tuple[list[dict[str, str]], str]:
             text = text[len("json") :]
         text = text.strip()
 
-    try:
-        parsed = json.loads(text)
-        raw_findings = parsed["findings"]
-        if not isinstance(raw_findings, list):
-            raise TypeError("findings is not a list")
-    except Exception:
-        return [], raw_text
+    raw_findings = None
+    for candidate in (text, _extract_json_object(text)):
+        if not candidate:
+            continue
+        try:
+            parsed = json.loads(candidate)
+            if not isinstance(parsed, dict):
+                continue
+            found = parsed["findings"]
+            if not isinstance(found, list):
+                continue
+        except Exception:
+            continue
+        raw_findings = found
+        break
+
+    if raw_findings is None:
+        return None, raw_text
 
     findings: list[dict[str, str]] = []
     for item in raw_findings:
@@ -490,6 +538,8 @@ def run_review_stream(
         total_input_tokens=usage["input_tokens"],
     )
     yield {
+        # findings is None when the response could not be parsed -- see
+        # _parse_findings. Consumers must not flatten that to [].
         "type": "done",
         "text": full_text,
         "findings": findings,
@@ -571,7 +621,9 @@ def run_review(
     ):
         if event["type"] == "done":
             full_text = event["text"]
-            findings = event["findings"]
+            # The CLI prints `text`, which carries the raw response when the
+            # parse failed, so it has nothing to do with the distinction.
+            findings = event["findings"] or []
             kb_context = event["kb_context"]
             usage = event["usage"]
             context_stats = event["context_stats"]
