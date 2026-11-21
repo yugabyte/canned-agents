@@ -1,4 +1,10 @@
 # canned-agents
+<a href="https://mekodata.ai">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/yugabyte/meko/main/assets/badges/meko-context-dark.svg">
+    <img width="112" height="30" src="https://raw.githubusercontent.com/yugabyte/meko/main/assets/badges/meko-context.svg" alt="Meko context">
+  </picture>
+</a>
 
 Starter pack of agents built on [Meko](https://mekodata.ai) — each one uses a
 Meko datapack for storing and retrieving context (knowledge base + memories),
